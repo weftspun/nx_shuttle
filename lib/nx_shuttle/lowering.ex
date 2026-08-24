@@ -59,8 +59,16 @@ defmodule NxShuttle.Lowering do
     simple(Map.fetch!(@unary, op), [inp], t, state)
   end
 
-  @binary %{add: "Add", subtract: "Sub", multiply: "Mul", divide: "Div", equal: "Equal",
-            pow: "Pow", max: "Max", min: "Min"}
+  @binary %{
+    add: "Add",
+    subtract: "Sub",
+    multiply: "Mul",
+    divide: "Div",
+    equal: "Equal",
+    pow: "Pow",
+    max: "Max",
+    min: "Min"
+  }
 
   defp apply_op(op, [lhs, rhs], t, params, state) when is_map_key(@binary, op) do
     {l, state} = do_lower(lhs, params, state)

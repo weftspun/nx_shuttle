@@ -10,12 +10,19 @@ defmodule NxShuttle.Reference do
   # statement than a run against the compiler, and reporting both as "passed" would be the
   # silent-skip failure wearing a different hat.
   #
-  #   :dfc    the compiler that has to accept the graph. Authoritative. Needs a licensed wheel
-  #           and a multi-gigabyte image, so it is exactly the reference that goes missing.
-  #   :ortex  ONNX Runtime in-process. Says the bytes are well formed and the arithmetic is
-  #           what Nx meant. Says NOTHING about whether the accelerator toolchain accepts it.
+  #   :dfc      the compiler that has to accept the graph. Authoritative. Needs a licensed wheel
+  #             and a multi-gigabyte image, so it is exactly the reference that goes missing.
+  #   :specref  the ONNX specification's own reference evaluator. Says the bytes are well formed
+  #             and mean what Nx meant. Says NOTHING about whether the accelerator accepts them.
+  #
+  # REPLACED ORTEX, and the reason is not that ONNX Runtime was wrong. It is that the spec
+  # evaluator is EXACT where a runtime is merely close -- 0 against Nx.BinaryBackend on every
+  # emitted case, where ONNX Runtime 1.20.1 deviates 2.38e-07 on sqrt and 5.96e-08 on erf -- and
+  # that an embedded interpreter packages into a Burrito binary where a Rust NIF plus a bundled
+  # ONNX Runtime does not. Both engines accept `Erf` and `Where`, so the contrast with the DFC
+  # that the secondary exists to provide is unchanged.
 
-  alias NxShuttle.DFC
+  alias NxShuttle.{DFC, SpecRef}
 
   @doc """
   Every engine that can run here, and a reason for each that cannot.
@@ -25,7 +32,7 @@ defmodule NxShuttle.Reference do
   check that runs whichever happened to be available.
   """
   def engines do
-    checks = [{:dfc, DFC.available()}, {:ortex, ortex_available()}]
+    checks = [{:dfc, DFC.available()}, {:specref, SpecRef.available()}]
     {ok, missing} = Enum.split_with(checks, fn {_e, r} -> r == :ok end)
     {Enum.map(ok, &elem(&1, 0)), Enum.map(missing, fn {e, {:error, w}} -> {e, w} end)}
   end
@@ -37,29 +44,12 @@ defmodule NxShuttle.Reference do
   """
   def run(:dfc, cases), do: DFC.run(cases)
 
-  def run(:ortex, cases), do: run({:ortex, nil}, cases)
-
-  def run({:ortex, _}, cases) do
-    Map.new(cases, fn %{name: name, model: model, input: input} ->
-      path = Path.join(System.tmp_dir!(), "#{name}_#{System.unique_integer([:positive])}.onnx")
-      File.write!(path, model)
-
-      try do
-        session = Ortex.load(path)
-        {out} = Ortex.run(session, {input})
-        {name, {:ok, Nx.backend_transfer(out, Nx.BinaryBackend)}}
-      rescue
-        e -> {name, {:error, Exception.message(e)}}
-      after
-        File.rm(path)
-      end
-    end)
-  end
+  def run(:specref, cases), do: SpecRef.run(cases)
 
   @doc """
   What a green run actually proved, given which engines ran.
   """
-  def caveat([:dfc, :ortex]),
+  def caveat([:dfc, :specref]),
     do: "both deployment targets ran and were cross-checked against each other"
 
   def caveat([:dfc]),
@@ -67,33 +57,27 @@ defmodule NxShuttle.Reference do
       "PRIMARY ONLY: the accelerator toolchain ran. Nothing was cross-checked, so a graph " <>
         "that deploys differently on the backup runtime would not show here."
 
-  def caveat([:ortex]),
+  def caveat([:specref]),
     do:
-      "BACKUP ONLY: ONNX Runtime ran. This proves the arithmetic, NOT that the accelerator " <>
-        "toolchain accepts the graph."
+      "SPEC ONLY: the ONNX reference evaluator ran. This proves the emitted graph is correct " <>
+        "per the specification, NOT that the accelerator toolchain accepts it. The two the DFC " <>
+        "refuses -- bare Erf, standalone Where -- both pass here, so a Hailo limitation is " <>
+        "invisible in this configuration."
 
   def caveat([]), do: "NOTHING RAN"
-
-  # RETRACTED: an earlier version refused ortex on windows-x86_64, claiming `Ortex.load/1`
-  # aborts the VM. That was ortex 0.1.7, which links ONNX Runtime DYNAMICALLY and died when
-  # `onnxruntime.dll` was not beside the NIF. 0.1.10 links it statically -- one 18.5 MB
-  # `libortex.dll` and no separate library -- and loads and runs here, max|diff| 0.0. The
-  # platform check is gone; availability is decided by whether the module is there.
-  defp ortex_available do
-    if Code.ensure_loaded?(Ortex),
-      do: :ok,
-      else: {:error, "ortex is not compiled into this environment"}
-  end
 
   @doc """
   The highest ONNX opset each engine can load, measured rather than declared.
 
-  Ortex bundles its own ONNX Runtime through the `ort` crate, so its ceiling is fixed at build
-  time and cannot be raised from mix.exs. Measured on 0.1.10: 21 loads, 22 does not. The
+  The spec evaluator's ceiling is the opset its `onnx` package implements, so it moves with the
+  pinned version rather than with a bundled runtime. onnx 1.17.0 implements up to 22. The
   compiler parsed 23. The emitter defaults to 17, which is under both, so nothing is currently
-  blocked -- but a graph needing 22 would deploy to the accelerator and not to the backup, and
-  that is the kind of thing that should fail a check rather than surface in production.
+  blocked -- but a graph needing 23 would deploy to the accelerator and not validate against the
+  specification, and that is the kind of thing that should fail a check rather than surface later.
+
+  RETRACTED WITH ORTEX: the previous ceiling here was 21, measured on ortex 0.1.10 (21 loads, 22
+  does not). That number described a bundled ONNX Runtime that is no longer in the tree.
   """
-  def opset_ceiling(:ortex), do: 21
+  def opset_ceiling(:specref), do: 22
   def opset_ceiling(:dfc), do: 23
 end

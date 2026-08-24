@@ -13,7 +13,8 @@ defmodule AxonOnnx.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       docs: docs(),
-      description: "Compile Nx defn to an ONNX graph, for accelerator toolchains that consume one",
+      description:
+        "Compile Nx defn to an ONNX graph, for accelerator toolchains that consume one",
       package: package(),
       preferred_cli_env: [
         docs: :docs,
@@ -38,15 +39,16 @@ defmodule AxonOnnx.MixProject do
     [
       {:protox, "~> 1.6.10"},
       {:nx, "~> 0.5", nx_opts()},
-      {:torchx, "~> 0.13.1"},
-      {:ortex, "~> 0.1", only: :test},
+      {:pythonx, "~> 0.4.10", only: :test},
       {:jason, "~> 1.2", only: :test},
       {:ex_doc, "~> 0.23", only: :docs}
     ] ++ exla_dep()
   end
 
-  # XLA publishes no windows-x86_64 archive, so EXLA cannot build there at all. Torchx is
-  # the backend on that platform and is required unconditionally above.
+  # XLA publishes no windows-x86_64 archive, so EXLA cannot build there at all -- still true,
+  # measured on xla v0.10.0 (2026-02-10), which ships nine assets and none for Windows. The
+  # reference backend is Nx.BinaryBackend, which needs neither, so this exclusion no longer
+  # strands any platform.
   defp exla_dep do
     case :os.type() do
       {:win32, _} ->

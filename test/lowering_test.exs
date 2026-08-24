@@ -15,7 +15,26 @@ defmodule NxShuttle.LoweringTest do
   @x Nx.iota({1, 4, 4, 2}, type: :f32) |> Nx.divide(8.0) |> Nx.add(0.5)
 
   setup_all do
-    Nx.default_backend(Torchx.Backend)
+    # THE SOURCE OF TRUTH, and it is deliberately the dullest thing available. Nx.BinaryBackend
+    # is Nx's own reference implementation: pure Elixir, no native dependency, identical on every
+    # platform. The reference is the one opinion here that never touches ONNX, so it is what
+    # catches a lowering bug -- and a reference should be boring rather than fast.
+    #
+    # REPLACED TORCHX. Measured against it across the twelve cases: seven bit-identical, worst
+    # gap 9.5e-7 on chain8, roughly 1 ULP of f32 and two orders under this suite's own 1.0e-5
+    # threshold. Nothing in the reported table moves.
+    #
+    # THE COST, stated rather than discovered. BinaryBackend is free at this size and only at
+    # this size. Same four ops, against Torchx:
+    #
+    #     32 elements (this suite)    0.1ms vs 0.1ms      1x
+    #     12288                       8.5ms vs 0.2ms     42x
+    #     150528 (224^2)            142.9ms vs 0.9ms    155x
+    #     1228800 (640^2)          1528.8ms vs 3.2ms    482x
+    #
+    # Four ops, not 825 nodes. This is a reference for op-level cases and cannot be one for a
+    # whole-model comparison; that needs a native backend, and nx_vulkan is the measured candidate.
+    Nx.default_backend(Nx.BinaryBackend)
 
     # An unmet precondition is a FAIL, not a skip. A suite that quietly runs zero comparisons
     # reports the same green as one that ran them all, and this reference is the kind that goes
