@@ -56,7 +56,20 @@ defmodule NxShuttle.Lowering do
   # `:logistic` op -- `Nx.sigmoid/1` builds `:sigmoid` -- so `Sigmoid` was unreachable and
   # `Nx.sigmoid` raised "no ONNX lowering" while a Sigmoid mapping sat right here. Found by
   # sweeping every operator this module claims to emit rather than the seven the suite covered.
-  @unary %{sqrt: "Sqrt", erf: "Erf", exp: "Exp", sigmoid: "Sigmoid", negate: "Neg"}
+  @unary %{
+    sqrt: "Sqrt",
+    erf: "Erf",
+    exp: "Exp",
+    sigmoid: "Sigmoid",
+    negate: "Neg",
+    abs: "Abs",
+    ceil: "Ceil",
+    cos: "Cos",
+    log: "Log",
+    sign: "Sign",
+    sin: "Sin",
+    tanh: "Tanh"
+  }
 
   defp apply_op(op, [arg], t, params, state) when is_map_key(@unary, op) do
     {inp, state} = do_lower(arg, params, state)
@@ -82,6 +95,129 @@ defmodule NxShuttle.Lowering do
     {l, state} = do_lower(lhs, params, state)
     {r, state} = do_lower(rhs, params, state)
     simple(Map.fetch!(@binary, op), [l, r], t, state)
+  end
+
+  # FLOOR IS REFUSED, and not because it is unsupported. The accelerator ACCEPTS it and does not
+  # perform it, which is the same defect the Cast rule below names and the reason that rule
+  # exists. Measured on x over [0.5, 5.375] step 0.125, against the compiler's own emulator:
+  #
+  #     max |dfc - floor(x)|   0.875     (the largest fractional part in the input)
+  #     max |dfc - x|          0.0       (it returned the input, untouched)
+  #
+  #     in    [0.5, 0.625, 0.75, 0.875]
+  #     out   [0.5, 0.625, 0.75, 0.875]
+  #     floor [0.0, 0.0,   0.0,  0.0  ]
+  #
+  # The spec evaluator computes it exactly, so the lowering was right and the target is wrong.
+  # A silently wrong number is worse than a refusal, so this refuses.
+  defp apply_op(:floor, [_arg], _t, _params, _state) do
+    raise ArgumentError,
+          "refusing to emit Floor: the target accepts it and returns its input unchanged " <>
+            "(measured max|dfc - x| = 0.0 where floor would have moved every element), so the " <>
+            "graph would compute something other than the function it came from"
+  end
+
+  # ROUND IS REFUSED FOR THE OPPOSITE REASON: the operator is fine and the SEMANTICS differ.
+  # `Nx.round/1` rounds half away from zero and ONNX `Round` rounds half to even. Measured on
+  # [0.5, 1.5, 2.5, -0.5]:
+  #
+  #     Nx     [1.0, 2.0, 3.0, -1.0]
+  #     ONNX   [0.0, 2.0, 2.0, -0.0]
+  #
+  # This was caught by the spec evaluator disagreeing by 1.0, which is what a permissive second
+  # engine is carried for -- the accelerator merely refused the node and would never have shown
+  # which of the two roundings the graph had asked for.
+  #
+  # It is refused rather than approximated because the specification has no half-away-from-zero
+  # rounding, and `sign(x) * floor(abs(x) + 0.5)` needs Floor, which is refused above.
+  defp apply_op(:round, [_arg], _t, _params, _state) do
+    raise ArgumentError,
+          "refusing to emit Round: Nx rounds half away from zero and ONNX Round rounds half " <>
+            "to even, so the emitted graph would disagree with the function it came from at " <>
+            "every exact half (measured 1.0 on 0.5)"
+  end
+
+  # LOGICAL_AND AS A MASK AND A MULTIPLY, which is the same shape the Where decomposition uses
+  # and the only one this target accepts. ONNX `And` takes booleans and Nx applies logical_and
+  # to floats, so the obvious route is Cast-to-bool then And -- refused here by the Cast rule
+  # below, because a float-to-bool Cast changes values and this target accepts a value-changing
+  # Cast without performing it.
+  #
+  # The mask is `min(max(|x| * k, eps), 1)`: 1 wherever x is nonzero, 0 at zero, built from Abs,
+  # Mul, Max and Min. Conjunction is the PRODUCT of the two masks.
+  #
+  # MEASURED, and the three forms do not fare alike:
+  #
+  #     min(abs(sign a), abs(sign b))   REJECTED TypeError
+  #     min(mask a, mask b)             REJECTED AccelerasValueError
+  #     mul(mask a, mask b)             compiles, float diff 0.0
+  #
+  # So `Mul` rather than `Min` even though both are conjunction on zero-or-one values, and no
+  # `Sign` -- Sign standing alone is refused by this target (InvalidHNError). An earlier version
+  # of this clause used abs(sign(x)) and could not run on the accelerator at all.
+  #
+  # `eps` is -1.0e-6 rather than 0.0 for the reason recorded in the logbook: an exact-zero floor
+  # is recognised as ReLU, which carries no clip_min, and the paired Min then fails with
+  # KeyError: 'clip_min'.
+  #
+  # THE OUTPUT TYPE DIFFERS AND IT IS DELIBERATE. Nx types logical_and as {:u, 8}; this emits
+  # float 0.0 or 1.0. The values agree and the labels do not. A Cast to fix the label would
+  # reintroduce exactly what the first paragraph refuses.
+  defp apply_op(:logical_and, [lhs, rhs], t, params, state) do
+    {l, state} = do_lower(lhs, params, state)
+    {r, state} = do_lower(rhs, params, state)
+
+    # THE MASK IS BUILT IN THE OPERAND'S TYPE, NOT THE RESULT'S. Nx types logical_and as
+    # {:u, 8}, and the scale constant 1.0e6 does not fit in a u8 -- building the constants
+    # against the output type fails at proto construction, which is how this was found.
+    ft = Nx.template(Nx.shape(t), Nx.type(lhs))
+
+    {lm, state} = nonzero_mask(l, ft, state)
+    {rm, state} = nonzero_mask(r, ft, state)
+    simple("Mul", [lm, rm], t, state)
+  end
+
+  # MOD DEFAULTS TO INTEGER MODULO, and float inputs need `fmod=1` or the compiler is being
+  # asked for the wrong function. Nx.remainder follows C fmod -- the sign of the dividend --
+  # which is what fmod=1 selects.
+  defp apply_op(:remainder, [lhs, rhs], _t, params, state) do
+    {l, state} = do_lower(lhs, params, state)
+    {r, state} = do_lower(rhs, params, state)
+    {name, state} = fresh("Mod", state)
+
+    node = %Node{
+      input: [l, r],
+      output: [name],
+      name: name,
+      op_type: "Mod",
+      attribute: [%Attribute{name: "fmod", type: :INT, i: 1}]
+    }
+
+    {name, push(state, node)}
+  end
+
+  # LOGICAL_NOT ARRIVES AS A BLOCK, not as an operator, and the struct is matched rather than
+  # the tag. `Nx.logical_not/1` builds `:block` carrying `%Nx.Block.LogicalNot{}` with a
+  # fallback that expands to `equal(t, 0)` -- and `Equal` is refused by the accelerator, so
+  # taking the fallback would lower a working operator into a rejected one. ONNX `Not` is the
+  # direct emission.
+  #
+  # THE MATCH IS NARROW ON PURPOSE. `Nx.Block` has 21 kinds -- Phase, TopK, CumulativeSum,
+  # FFT2, the whole LinAlg family. A clause that matched `:block` alone would silently accept
+  # every one of them and emit `Not`, which is the failure this module's catch-all exists to
+  # prevent. Everything that is not LogicalNot falls through to "no ONNX lowering", and a
+  # negative control in the suite holds that open.
+  defp apply_op(:block, [%Nx.Block.LogicalNot{}, [arg], _out | _], t, params, state) do
+    {inp, state} = do_lower(arg, params, state)
+    simple("Not", [inp], t, state)
+  end
+
+  # RSQRT IS TWO NODES: the specification has no Rsqrt, and Reciprocal(Sqrt(x)) is the form it
+  # leaves to the caller. Read out of `onnx.defs` at opset 17 rather than assumed.
+  defp apply_op(:rsqrt, [arg], t, params, state) do
+    {inp, state} = do_lower(arg, params, state)
+    {root, state} = simple("Sqrt", [inp], t, state)
+    simple("Reciprocal", [root], t, state)
   end
 
   # NOT_EQUAL IS TWO NODES, because the specification does not carry it. Read out of `onnx.defs`
@@ -217,6 +353,34 @@ defmodule NxShuttle.Lowering do
   defp lossy_cast?({:u, _}, {:s, _}), do: true
   defp lossy_cast?({:f, a}, {:f, b}), do: b < a
   defp lossy_cast?(_, _), do: false
+
+  # One arithmetic predicate: 1 where the input is nonzero, 0 where it is not. Used by
+  # logical_and; kept separate because any other boolean lowering will want the same shape.
+  defp nonzero_mask(input, t, state) do
+    {a, state} = simple("Abs", [input], t, state)
+    {big, state} = scalar_const(1.0e6, t, state)
+    {scaled, state} = simple("Mul", [a, big], t, state)
+    {eps, state} = scalar_const(-1.0e-6, t, state)
+    {lo, state} = simple("Max", [scaled, eps], t, state)
+    {one, state} = scalar_const(1.0, t, state)
+    simple("Min", [lo, one], t, state)
+  end
+
+  # A broadcast scalar, emitted the same way the :constant clause does it.
+  defp scalar_const(value, t, state) do
+    {name, state} = fresh("Constant", state)
+    tensor = to_tensor_proto(Nx.tensor(value, type: Nx.type(t)) |> Nx.broadcast(Nx.shape(t)))
+
+    node = %Node{
+      input: [],
+      output: [name],
+      name: name,
+      op_type: "Constant",
+      attribute: [%Attribute{name: "value", type: :TENSOR, t: tensor}]
+    }
+
+    {name, push(state, node)}
+  end
 
   defp simple(op_type, inputs, _t, state) do
     {name, state} = fresh(op_type, state)
