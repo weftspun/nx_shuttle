@@ -39,11 +39,23 @@ defmodule AxonOnnx.MixProject do
       {:axon, "~> 0.5", axon_opts()},
       {:protox, "~> 1.6.10"},
       {:nx, "~> 0.5", nx_opts()},
-      {:exla, "~> 0.5", [only: :test] ++ exla_opts()},
+      {:torchx, "~> 0.13.1"},
       {:req, "~> 0.1.0", only: :test},
       {:jason, "~> 1.2", only: :test},
       {:ex_doc, "~> 0.23", only: :docs}
-    ]
+    ] ++ exla_dep()
+  end
+
+  # XLA publishes no windows-x86_64 archive, so EXLA cannot build there at all. Torchx is
+  # the backend on that platform and is required unconditionally above.
+  defp exla_dep do
+    case :os.type() do
+      {:win32, _} ->
+        []
+
+      _ ->
+        [{:exla, "~> 0.5", [only: :test] ++ exla_opts()}]
+    end
   end
 
   defp package do
