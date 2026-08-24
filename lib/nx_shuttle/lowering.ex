@@ -69,6 +69,10 @@ defmodule NxShuttle.Lowering do
     multiply: "Mul",
     divide: "Div",
     equal: "Equal",
+    greater: "Greater",
+    greater_equal: "GreaterOrEqual",
+    less: "Less",
+    less_equal: "LessOrEqual",
     pow: "Pow",
     max: "Max",
     min: "Min"
@@ -78,6 +82,17 @@ defmodule NxShuttle.Lowering do
     {l, state} = do_lower(lhs, params, state)
     {r, state} = do_lower(rhs, params, state)
     simple(Map.fetch!(@binary, op), [l, r], t, state)
+  end
+
+  # NOT_EQUAL IS TWO NODES, because the specification does not carry it. Read out of `onnx.defs`
+  # at opset 17 rather than assumed: Less, Greater, LessOrEqual, GreaterOrEqual, Equal and Not
+  # are all present and NotEqual is not, so the negation is left to the caller. Every other
+  # comparison is one node and sits in @binary above.
+  defp apply_op(:not_equal, [lhs, rhs], t, params, state) do
+    {l, state} = do_lower(lhs, params, state)
+    {r, state} = do_lower(rhs, params, state)
+    {eq, state} = simple("Equal", [l, r], t, state)
+    simple("Not", [eq], t, state)
   end
 
   defp apply_op(:select, [pred, on_true, on_false], t, params, state) do

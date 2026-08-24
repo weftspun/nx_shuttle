@@ -333,6 +333,31 @@ defmodule NxShuttle.LoweringTest do
       assert_raise FunctionClauseError, fn -> DFC.precision_script(:a32_w32) end
     end
 
+    test "every ordering comparison lowers to the operator it claims" do
+      # NODE TYPE, NOT {:ok, _}. The Sigmoid bug was a map entry that could never fire, and a
+      # weaker assertion passes on a lowering that emits the wrong operator entirely.
+      #
+      # not_equal is two nodes because the specification has no NotEqual -- read out of
+      # onnx.defs at opset 17, which carries Less, Greater, LessOrEqual, GreaterOrEqual, Equal
+      # and Not, and leaves the negation to the caller.
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
+
+      for {fun, wanted} <- [
+            {&Nx.less(&1, 2.9), ["Less"]},
+            {&Nx.greater(&1, 2.9), ["Greater"]},
+            {&Nx.less_equal(&1, 2.9), ["LessOrEqual"]},
+            {&Nx.greater_equal(&1, 2.9), ["GreaterOrEqual"]},
+            {&Nx.not_equal(&1, 2.9), ["Equal", "Not"]}
+          ] do
+        assert {:ok, model} = NxShuttle.to_model(fun, tpl)
+        ops = for n <- model.graph.node, do: n.op_type
+
+        for want <- wanted do
+          assert want in ops, "expected #{want}, got #{inspect(ops)}"
+        end
+      end
+    end
+
     test "a dot that is not a trailing/leading contraction is reported" do
       tpl = [Nx.template({2, 4}, :f32), Nx.template({2, 4}, :f32)]
       assert {:error, message} = NxShuttle.to_model(fn x, y -> Nx.dot(x, [0], y, [0]) end, tpl)
