@@ -39,6 +39,7 @@ defmodule AxonOnnx.MixProject do
       {:protox, "~> 1.6.10"},
       {:nx, "~> 0.5", nx_opts()},
       {:torchx, "~> 0.13.1"},
+      {:ortex, "~> 0.1", only: :test},
       {:jason, "~> 1.2", only: :test},
       {:ex_doc, "~> 0.23", only: :docs}
     ] ++ exla_dep()

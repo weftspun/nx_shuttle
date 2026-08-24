@@ -7,7 +7,7 @@ defmodule NxShuttle.LoweringTest do
   # answer. So the DFC parses each graph and its native emulator runs it, and the number it
   # returns is what the lowering is measured against.
 
-  alias NxShuttle.DFC
+  alias NxShuttle.Reference
 
   # ONNX is NCHW by convention and the DFC works in NHWC, so every case is rank-4 and the
   # transpose happens in DFC.run/1. A rank-2 graph is rejected on its shape, which would read
@@ -20,28 +20,34 @@ defmodule NxShuttle.LoweringTest do
     # An unmet precondition is a FAIL, not a skip. A suite that quietly runs zero comparisons
     # reports the same green as one that ran them all, and this reference is the kind that goes
     # missing: it needs a licensed wheel and a multi-gigabyte image.
-    case DFC.available() do
-      :ok ->
-        :ok
+    case Reference.engine() do
+      {:ok, engine} ->
+        IO.puts("
+  " <> Reference.caveat(engine))
+        {:ok, engine: engine}
 
-      {:error, why} ->
+      {:error, {dfc_why, ortex_why}} ->
         raise """
-        The Hailo Dataflow Compiler is not runnable here, so nothing can be measured: #{why}
+        Nothing can be measured here. Neither reference is runnable:
 
-        Build it with deploy/hailo-dfc/build.sh in weftspun/rf-detr-cpp; it needs the licensed
-        wheel from hailo.ai, which is not redistributable and is not in any repository.
+          Dataflow Compiler: #{dfc_why}
+          ONNX Runtime:      #{ortex_why}
+
+        The compiler is the authoritative one; build it with deploy/hailo-dfc/build.sh in
+        weftspun/rf-detr-cpp. It needs the licensed wheel from hailo.ai, which is not
+        redistributable and is in no repository.
         """
     end
   end
 
-  defp compile_all(cases) do
+  defp compile_all(engine, cases) do
     tpl = [Nx.template(Nx.shape(@x), Nx.type(@x))]
 
     cases
     |> Enum.map(fn {name, fun} ->
       %{name: name, model: NxShuttle.encode(NxShuttle.to_model!(fun, tpl)), input: @x}
     end)
-    |> DFC.run()
+    |> then(&Reference.run(engine, &1))
   end
 
   defp cases do
@@ -58,9 +64,9 @@ defmodule NxShuttle.LoweringTest do
   end
 
   describe "what the Dataflow Compiler accepts, and whether it computes what Nx does" do
-    test "each operator, against the compiler's own emulator" do
+    test "each operator, against the chosen reference", %{engine: engine} do
       cs = cases()
-      results = compile_all(cs)
+      results = compile_all(engine, cs)
       funs = Map.new(cs)
 
       rows =
@@ -100,14 +106,14 @@ defmodule NxShuttle.LoweringTest do
   end
 
   describe "negative controls" do
-    test "a subtraction lowered with its operands swapped must NOT agree" do
+    test "a subtraction lowered with its operands swapped must NOT agree", %{engine: engine} do
       # Sub is not commutative, so a reversed lowering is exactly the class of bug the
       # agreement test above exists to catch. If this passes, that test is decoration.
       tpl = [Nx.template(Nx.shape(@x), Nx.type(@x))]
       swapped = fn t -> Nx.subtract(Nx.multiply(t, 0.0) |> Nx.add(0.25), t) end
 
       results =
-        DFC.run([
+        Reference.run(engine, [
           %{name: "swapped", model: NxShuttle.encode(NxShuttle.to_model!(swapped, tpl)), input: @x}
         ])
 
@@ -146,6 +152,29 @@ defmodule NxShuttle.LoweringTest do
       tpl = [Nx.template({1, 4, 4, 2}, :f32)]
       assert {:ok, model} = NxShuttle.to_model(&Nx.as_type(&1, {:f, 32}), tpl)
       assert is_struct(model, Onnx.ModelProto)
+    end
+
+    test "when the compiler is missing, the fallback is chosen or the run fails by name" do
+      # The selection rule itself is checked, because a fallback nothing ever takes is a rule
+      # nobody has verified. Pointing at an image that does not exist forces the miss.
+      System.put_env("NX_SHUTTLE_DFC_IMAGE", "nx-shuttle-no-such-image:never")
+
+      try do
+        case Reference.engine() do
+          {:ok, {:ortex, why}} ->
+            assert why =~ "is not built"
+            assert Reference.caveat({:ortex, why}) =~ "FALLBACK"
+
+          {:error, {dfc_why, ortex_why}} ->
+            assert dfc_why =~ "is not built"
+            assert ortex_why != ""
+
+          {:ok, :dfc} ->
+            flunk("the compiler was selected despite pointing at an image that does not exist")
+        end
+      after
+        System.delete_env("NX_SHUTTLE_DFC_IMAGE")
+      end
     end
 
     test "a dot that is not a trailing/leading contraction is reported" do

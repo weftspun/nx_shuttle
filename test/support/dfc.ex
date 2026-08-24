@@ -10,10 +10,13 @@ defmodule NxShuttle.DFC do
   # It ships as a licensed wheel and runs in a container, so it cannot be embedded. Cases are
   # therefore batched into one container invocation rather than one per case.
 
-  @image "weftspun-hailo-dfc:latest"
+  @default_image "weftspun-hailo-dfc:latest"
   @arch "hailo10h"
 
-  def image, do: @image
+  # Read at runtime rather than baked in, so the fallback path can be exercised by pointing
+  # this at an image that does not exist. A selection rule nothing ever takes is a rule nobody
+  # has checked.
+  def image, do: System.get_env("NX_SHUTTLE_DFC_IMAGE") || @default_image
 
   @doc """
   Returns `:ok` when the compiler can actually be run, `{:error, reason}` otherwise.
@@ -21,8 +24,8 @@ defmodule NxShuttle.DFC do
   def available do
     with {_, 0} <- System.cmd("docker", ["version", "--format", "{{.Server.Os}}"], stderr_to_stdout: true),
          {out, 0} <-
-           System.cmd("docker", ["images", "-q", @image], stderr_to_stdout: true) do
-      if String.trim(out) == "", do: {:error, "docker image #{@image} is not built"}, else: :ok
+           System.cmd("docker", ["images", "-q", image()], stderr_to_stdout: true) do
+      if String.trim(out) == "", do: {:error, "docker image #{image()} is not built"}, else: :ok
     else
       {out, code} -> {:error, "docker unavailable (exit #{code}): #{String.trim(out)}"}
     end
@@ -57,7 +60,7 @@ defmodule NxShuttle.DFC do
       {out, code} =
         System.cmd(
           "docker",
-          ["run", "--rm", "-v", "#{windows_path(dir)}:/work", @image, "python", "/work/run.py"],
+          ["run", "--rm", "-v", "#{windows_path(dir)}:/work", image(), "python", "/work/run.py"],
           stderr_to_stdout: true,
           env: [{"MSYS_NO_PATHCONV", "1"}]
         )
