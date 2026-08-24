@@ -358,6 +358,62 @@ defmodule NxShuttle.LoweringTest do
       end
     end
 
+    test "the remaining unary and composite lowerings emit what they claim" do
+      # Node type rather than {:ok, _}, for the reason Sigmoid gave: a map entry that can never
+      # fire and one that fires wrongly both satisfy the weaker check.
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
+
+      for {fun, wanted} <- [
+            {&Nx.logical_not/1, ["Not"]},
+            {&Nx.abs/1, ["Abs"]},
+            {&Nx.ceil/1, ["Ceil"]},
+            {&Nx.cos/1, ["Cos"]},
+            {&Nx.log/1, ["Log"]},
+            {&Nx.sign/1, ["Sign"]},
+            {&Nx.sin/1, ["Sin"]},
+            {&Nx.tanh/1, ["Tanh"]},
+            {&Nx.rsqrt/1, ["Sqrt", "Reciprocal"]},
+            {&Nx.remainder(&1, 2.0), ["Mod"]},
+            # Abs, Mul, Max, Min -- the mask-and-multiply form. NOT Sign: the earlier version
+            # used abs(sign(x)) and the accelerator refuses Sign standing alone, so it could
+            # not run there at all. This control is what caught the change.
+            {&Nx.logical_and(&1, 1.0), ["Abs", "Mul", "Max", "Min"]}
+          ] do
+        assert {:ok, model} = NxShuttle.to_model(fun, tpl)
+        ops = for n <- model.graph.node, do: n.op_type
+
+        for want <- wanted do
+          assert want in ops, "expected #{want}, got #{inspect(ops)}"
+        end
+      end
+    end
+
+    test "a block that is not LogicalNot is still reported, not silently lowered" do
+      # THE CONTROL THE :block CLAUSE NEEDS. Nx.Block has 21 kinds and only LogicalNot has a
+      # lowering. A clause matching `:block` alone would accept every one of them and emit Not,
+      # and would look identical to a correct one until something downstream computed nonsense.
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
+
+      assert {:error, message} = NxShuttle.to_model(&Nx.cumulative_sum(&1, axis: 0), tpl)
+      assert message =~ "no ONNX lowering"
+    end
+
+    test "Floor is refused, because the target accepts it and returns its input" do
+      # Measured: max|dfc - x| = 0.0 where floor would have moved every element. Same class as
+      # the Cast defect above, and refused for the same reason.
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
+      assert {:error, message} = NxShuttle.to_model(&Nx.floor/1, tpl)
+      assert message =~ "refusing to emit Floor"
+    end
+
+    test "Round is refused, because Nx and ONNX round halves differently" do
+      # Nx rounds half away from zero, ONNX Round rounds half to even: [1.0, 2.0, 3.0, -1.0]
+      # against [0.0, 2.0, 2.0, -0.0]. Found by the spec evaluator, which disagreed by 1.0.
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
+      assert {:error, message} = NxShuttle.to_model(&Nx.round/1, tpl)
+      assert message =~ "refusing to emit Round"
+    end
+
     test "a dot that is not a trailing/leading contraction is reported" do
       tpl = [Nx.template({2, 4}, :f32), Nx.template({2, 4}, :f32)]
       assert {:error, message} = NxShuttle.to_model(fn x, y -> Nx.dot(x, [0], y, [0]) end, tpl)
