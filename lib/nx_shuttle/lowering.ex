@@ -1,4 +1,4 @@
-defmodule NxOnnx.Lowering do
+defmodule NxShuttle.Lowering do
   @moduledoc false
 
   # Lowers an Nx.Defn.Expr tree to ONNX nodes. Axon's IR names layers, not tensor
@@ -75,7 +75,23 @@ defmodule NxOnnx.Lowering do
     simple("Where", [p, a, b], t, state)
   end
 
+  # A CAST THAT CHANGES VALUES IS REFUSED, because the target accepts it and then does not
+  # perform it. Measured against the Dataflow Compiler's own emulator, a f32 -> s32 -> f32
+  # round trip parsed cleanly and came back untruncated, disagreeing with Nx by 0.875. A
+  # silently wrong number is worse than a refusal. Casts that only relabel -- float to float,
+  # int to int -- do not change values and are emitted, which is what a real export's Cast
+  # nodes are.
   defp apply_op(:as_type, [arg], t, params, state) do
+    from = Nx.type(arg)
+    to = Nx.type(t)
+
+    if lossy_cast?(from, to) do
+      raise ArgumentError,
+            "refusing to emit a Cast from #{inspect(from)} to #{inspect(to)}: the target " <>
+              "accepts a value-changing Cast and does not apply it, so the graph would " <>
+              "compute something other than the function it came from"
+    end
+
     {inp, state} = do_lower(arg, params, state)
     {name, state} = fresh("Cast", state)
 
@@ -84,7 +100,7 @@ defmodule NxOnnx.Lowering do
       output: [name],
       name: name,
       op_type: "Cast",
-      attribute: [%Attribute{name: "to", type: :INT, i: onnx_type(Nx.type(t))}]
+      attribute: [%Attribute{name: "to", type: :INT, i: onnx_type(to)}]
     }
 
     {name, push(state, node)}
@@ -164,8 +180,16 @@ defmodule NxOnnx.Lowering do
 
   defp apply_op(op, _args, _t, _params, _state) do
     raise ArgumentError,
-          "NxOnnx.Lowering has no ONNX lowering for Nx operation #{inspect(op)}"
+          "NxShuttle.Lowering has no ONNX lowering for Nx operation #{inspect(op)}"
   end
+
+  defp lossy_cast?({:f, _}, {k, _}) when k in [:s, :u], do: true
+  defp lossy_cast?({:s, a}, {:s, b}), do: b < a
+  defp lossy_cast?({:u, a}, {:u, b}), do: b < a
+  defp lossy_cast?({:s, _}, {:u, _}), do: true
+  defp lossy_cast?({:u, _}, {:s, _}), do: true
+  defp lossy_cast?({:f, a}, {:f, b}), do: b < a
+  defp lossy_cast?(_, _), do: false
 
   defp simple(op_type, inputs, _t, state) do
     {name, state} = fresh(op_type, state)

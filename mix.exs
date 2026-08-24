@@ -1,19 +1,19 @@
 defmodule AxonOnnx.MixProject do
   use Mix.Project
 
-  @source_url "https://github.com/weftspun/nx_onnx"
+  @source_url "https://github.com/weftspun/nx_shuttle"
   @version "0.4.0"
 
   def project do
     [
-      app: :nx_onnx,
+      app: :nx_shuttle,
       version: @version,
-      name: "NxOnnx",
+      name: "NxShuttle",
       elixir: "~> 1.13",
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       docs: docs(),
-      description: "Compile Nx defn to ONNX",
+      description: "Compile Nx defn to an ONNX graph, for accelerator toolchains that consume one",
       package: package(),
       preferred_cli_env: [
         docs: :docs,
@@ -39,7 +39,6 @@ defmodule AxonOnnx.MixProject do
       {:protox, "~> 1.6.10"},
       {:nx, "~> 0.5", nx_opts()},
       {:torchx, "~> 0.13.1"},
-      {:pythonx, "~> 0.4", only: :test},
       {:jason, "~> 1.2", only: :test},
       {:ex_doc, "~> 0.23", only: :docs}
     ] ++ exla_dep()
@@ -67,7 +66,7 @@ defmodule AxonOnnx.MixProject do
 
   defp docs do
     [
-      main: "NxOnnx",
+      main: "NxShuttle",
       source_ref: "v#{@version}",
       source_url: @source_url
     ]

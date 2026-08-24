@@ -1,13 +1,13 @@
-defmodule NxOnnx do
+defmodule NxShuttle do
   @moduledoc """
   Compiles an `Nx.Defn` function to an ONNX graph.
 
   This compiles; it does not execute. `Nx.Defn.Expr` is traced and lowered to ONNX nodes by
-  `NxOnnx.Lowering`, and the result is a `Onnx.ModelProto` you can write to disk and hand to
+  `NxShuttle.Lowering`, and the result is a `Onnx.ModelProto` you can write to disk and hand to
   a downstream compiler or runtime.
 
       iex> f = fn x, y -> Nx.add(x, y) end
-      iex> {:ok, model} = NxOnnx.to_model(f, [Nx.template({2}, :f32), Nx.template({2}, :f32)])
+      iex> {:ok, model} = NxShuttle.to_model(f, [Nx.template({2}, :f32), Nx.template({2}, :f32)])
       iex> length(model.graph.node)
       1
 
@@ -61,11 +61,11 @@ defmodule NxOnnx do
     expr = apply(Nx.Defn.debug_expr(fun), templates)
     params = names |> Enum.with_index() |> Map.new(fn {n, i} -> {i, n} end)
 
-    {out, nodes, inits, _state} = NxOnnx.Lowering.lower(expr, params)
+    {out, nodes, inits, _state} = NxShuttle.Lowering.lower(expr, params)
 
     graph = %Graph{
       node: Enum.reverse(nodes),
-      name: opts[:name] || "nx_onnx",
+      name: opts[:name] || "nx_shuttle",
       doc_string: opts[:doc_string] || "",
       input: Enum.zip_with(names, templates, &value_info/2),
       output: [value_info(out, expr)],
@@ -75,8 +75,8 @@ defmodule NxOnnx do
     {:ok,
      %Model{
        ir_version: @ir_version,
-       producer_name: "nx_onnx",
-       producer_version: Application.spec(:nx_onnx, :vsn) |> to_string(),
+       producer_name: "nx_shuttle",
+       producer_version: Application.spec(:nx_shuttle, :vsn) |> to_string(),
        opset_import: [%Opset{domain: "", version: opset}],
        graph: graph
      }}
@@ -121,7 +121,7 @@ defmodule NxOnnx do
         value:
           {:tensor_type,
            %Placeholder{
-             elem_type: NxOnnx.Lowering.onnx_type(Nx.type(tensor)),
+             elem_type: NxShuttle.Lowering.onnx_type(Nx.type(tensor)),
              shape: %Shape{dim: dims}
            }}
       }

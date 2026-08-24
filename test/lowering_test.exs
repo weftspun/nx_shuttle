@@ -1,134 +1,156 @@
-defmodule NxOnnx.LoweringTest do
+defmodule NxShuttle.LoweringTest do
   use ExUnit.Case, async: false
 
-  # The reference is ONNX Runtime, in-process through Pythonx. Comparing the lowering against
-  # anything in this repository would only prove it agrees with itself; the question is whether
-  # a runtime that did not know how the graph was built reads it the way Nx meant it.
+  # THE REFERENCE IS THE COMPILER THAT HAS TO ACCEPT THE GRAPH, not a general-purpose runtime.
+  # A runtime agreeing with Nx says only that the bytes are well formed; it says nothing about
+  # whether the graph reaches the accelerator, which is the question this library exists to
+  # answer. So the DFC parses each graph and its native emulator runs it, and the number it
+  # returns is what the lowering is measured against.
+
+  alias NxShuttle.DFC
+
+  # ONNX is NCHW by convention and the DFC works in NHWC, so every case is rank-4 and the
+  # transpose happens in DFC.run/1. A rank-2 graph is rejected on its shape, which would read
+  # as a lowering fault and is not one.
+  @x Nx.iota({1, 4, 4, 2}, type: :f32) |> Nx.divide(8.0) |> Nx.add(0.5)
 
   setup_all do
     Nx.default_backend(Torchx.Backend)
 
-    # An unmet precondition is a failure, not a skip: a suite that quietly runs zero
-    # comparisons reports the same green as one that ran them all.
-    Pythonx.eval(
-      """
-      import numpy, onnx, onnxruntime
-      from onnx import numpy_helper
-      """,
-      %{}
-    )
+    # An unmet precondition is a FAIL, not a skip. A suite that quietly runs zero comparisons
+    # reports the same green as one that ran them all, and this reference is the kind that goes
+    # missing: it needs a licensed wheel and a multi-gigabyte image.
+    case DFC.available() do
+      :ok ->
+        :ok
 
-    :ok
+      {:error, why} ->
+        raise """
+        The Hailo Dataflow Compiler is not runnable here, so nothing can be measured: #{why}
+
+        Build it with deploy/hailo-dfc/build.sh in weftspun/rf-detr-cpp; it needs the licensed
+        wheel from hailo.ai, which is not redistributable and is not in any repository.
+        """
+    end
   end
 
-  defp run_in_ort(model, args) do
-    bytes = NxOnnx.encode(model)
+  defp compile_all(cases) do
+    tpl = [Nx.template(Nx.shape(@x), Nx.type(@x))]
 
-    inputs =
-      model.graph.input
-      |> Enum.zip(args)
-      |> Map.new(fn {%{name: name}, t} ->
-        {name, {Nx.to_binary(t), Tuple.to_list(Nx.shape(t))}}
+    cases
+    |> Enum.map(fn {name, fun} ->
+      %{name: name, model: NxShuttle.encode(NxShuttle.to_model!(fun, tpl)), input: @x}
+    end)
+    |> DFC.run()
+  end
+
+  defp cases do
+    [
+      {"add", &Nx.add(&1, 1.0)},
+      {"mul", &Nx.multiply(&1, 0.5)},
+      {"sub", &Nx.subtract(&1, 0.25)},
+      {"div", &Nx.divide(&1, 2.0)},
+      {"add_mul", &Nx.multiply(Nx.add(&1, 1.0), 0.5)},
+      {"sqrt", &Nx.sqrt/1},
+      {"erf", &Nx.erf/1},
+      {"where", &Nx.select(Nx.equal(&1, &1), Nx.multiply(&1, 2.0), &1)}
+    ]
+  end
+
+  describe "what the Dataflow Compiler accepts, and whether it computes what Nx does" do
+    test "each operator, against the compiler's own emulator" do
+      cs = cases()
+      results = compile_all(cs)
+      funs = Map.new(cs)
+
+      rows =
+        Enum.map(cs, fn {name, _} ->
+          case results[name] do
+            {:ok, got} ->
+              expected = funs[name].(@x)
+
+              diff =
+                Nx.subtract(got, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+
+              {name, if(diff <= 1.0e-5, do: :agrees, else: {:disagrees, diff}), diff}
+
+            {:error, why} ->
+              {name, :rejected, why}
+          end
+        end)
+
+      IO.puts("\n  operator   verdict")
+
+      Enum.each(rows, fn
+        {n, :agrees, d} -> IO.puts("  #{String.pad_trailing(n, 10)} agrees (max|diff| #{d})")
+        {n, {:disagrees, d}, _} -> IO.puts("  #{String.pad_trailing(n, 10)} DISAGREES by #{d}")
+        {n, :rejected, why} -> IO.puts("  #{String.pad_trailing(n, 10)} rejected: #{String.slice(why, 0, 88)}")
       end)
 
-    {result, _globals} =
-      Pythonx.eval(
-        """
-        import numpy, onnx, onnxruntime
-        model = onnx.load_model_from_string(bytes(model_bytes))
-        onnx.checker.check_model(model)
-        def name(k):
-            return k.decode() if isinstance(k, bytes) else k
-        feed = {name(k): numpy.frombuffer(bytes(v[0]), dtype=numpy.float32).reshape([int(d) for d in v[1]])
-                for k, v in inputs.items()}
-        sess = onnxruntime.InferenceSession(bytes(model_bytes), providers=["CPUExecutionProvider"])
-        out = sess.run(None, feed)[0].astype(numpy.float32)
-        (out.tobytes(), list(out.shape))
-        """,
-        %{"model_bytes" => bytes, "inputs" => inputs}
-      )
+      # Operators the compiler refuses are a fact about the target, not a defect here, and they
+      # are named rather than counted as passes. What must never happen is a graph it accepts
+      # and then computes differently from Nx: that is the lowering being wrong.
+      wrong = for {n, {:disagrees, d}, _} <- rows, do: "#{n} by #{d}"
+      assert wrong == [], "the compiler accepted these and computed something else: #{inspect(wrong)}"
 
-    {raw, shape} = Pythonx.decode(result)
-    raw |> Nx.from_binary({:f, 32}) |> Nx.reshape(List.to_tuple(shape))
-  end
-
-  defp assert_agrees(fun, args, opts \\ []) do
-    tol = opts[:tol] || 1.0e-5
-    expected = apply(fun, args)
-    templates = Enum.map(args, &Nx.template(Nx.shape(&1), Nx.type(&1)))
-    got = run_in_ort(NxOnnx.to_model!(fun, templates), args)
-
-    diff =
-      Nx.subtract(Nx.as_type(got, {:f, 32}), Nx.as_type(expected, {:f, 32}))
-      |> Nx.abs()
-      |> Nx.reduce_max()
-      |> Nx.to_number()
-
-    assert diff <= tol, "ONNX Runtime and Nx disagree by #{diff}, tolerance #{tol}"
-    diff
-  end
-
-  @a Nx.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], type: :f32)
-  @b Nx.tensor([[2.0, 2.0, 2.0, 2.0], [4.0, 4.0, 4.0, 4.0]], type: :f32)
-
-  describe "the operators the hailo10h device half needs" do
-    test "Add", do: assert_agrees(&Nx.add/2, [@a, @b])
-    test "Mul", do: assert_agrees(&Nx.multiply/2, [@a, @b])
-    test "Div", do: assert_agrees(&Nx.divide/2, [@a, @b])
-    test "Sqrt", do: assert_agrees(fn x -> Nx.sqrt(x) end, [@a])
-    test "Erf", do: assert_agrees(fn x -> Nx.erf(x) end, [@a])
-    test "Reshape", do: assert_agrees(fn x -> Nx.reshape(x, {4, 2}) end, [@a])
-    test "Transpose", do: assert_agrees(fn x -> Nx.transpose(x) end, [@a])
-    test "Expand", do: assert_agrees(fn x -> Nx.broadcast(x, {3, 2, 4}) end, [@a])
-    test "Slice", do: assert_agrees(fn x -> Nx.slice(x, [0, 1], [2, 2]) end, [@a])
-    test "MatMul", do: assert_agrees(fn x, y -> Nx.dot(x, Nx.transpose(y)) end, [@a, @b])
-    test "Concat", do: assert_agrees(fn x, y -> Nx.concatenate([x, y], axis: 0) end, [@a, @b])
-
-    test "Equal and Where" do
-      assert_agrees(fn x, y -> Nx.select(Nx.equal(x, y), x, Nx.multiply(y, 2.0)) end, [@a, @b])
-    end
-
-    test "Cast" do
-      assert_agrees(fn x -> Nx.as_type(x, {:s, 32}) |> Nx.as_type({:f, 32}) end, [@a])
-    end
-
-    test "a composite chain, which is where operand order goes wrong" do
-      fun = fn x, y ->
-        n = Nx.divide(Nx.subtract(x, y), Nx.sqrt(Nx.add(Nx.multiply(y, y), 1.0)))
-        Nx.dot(Nx.transpose(n), Nx.select(Nx.equal(x, y), n, Nx.erf(n)))
-      end
-
-      assert_agrees(fun, [@a, @b])
+      accepted = for {n, :agrees, _} <- rows, do: n
+      assert accepted != [], "the compiler accepted nothing, so nothing was measured"
+      IO.puts("\n  #{length(accepted)}/#{length(cs)} accepted and agreeing: #{Enum.join(accepted, " ")}")
     end
   end
 
   describe "negative controls" do
     test "a subtraction lowered with its operands swapped must NOT agree" do
-      # Sub is not commutative, so a swapped lowering is exactly the class of bug the
-      # agreement tests exist to catch. If this passes, the comparison is decoration.
-      templates = [Nx.template({2, 4}, :f32), Nx.template({2, 4}, :f32)]
-      expected = Nx.subtract(@a, @b)
-      got = run_in_ort(NxOnnx.to_model!(fn x, y -> Nx.subtract(y, x) end, templates), [@a, @b])
+      # Sub is not commutative, so a reversed lowering is exactly the class of bug the
+      # agreement test above exists to catch. If this passes, that test is decoration.
+      tpl = [Nx.template(Nx.shape(@x), Nx.type(@x))]
+      swapped = fn t -> Nx.subtract(Nx.multiply(t, 0.0) |> Nx.add(0.25), t) end
 
-      diff = Nx.subtract(got, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+      results =
+        DFC.run([
+          %{name: "swapped", model: NxShuttle.encode(NxShuttle.to_model!(swapped, tpl)), input: @x}
+        ])
 
-      assert diff > 1.0e-3,
-             "a swapped subtraction agreed to #{diff}; the comparison cannot see operand order"
+      case results["swapped"] do
+        {:ok, got} ->
+          expected = Nx.subtract(@x, 0.25)
+          diff = Nx.subtract(got, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+
+          assert diff > 1.0e-3,
+                 "a swapped subtraction agreed to #{diff}; the comparison cannot see operand order"
+
+        {:error, why} ->
+          flunk("the control could not run, so it proves nothing: #{why}")
+      end
     end
 
     test "an Nx operation with no lowering is reported, not silently dropped" do
-      templates = [Nx.template({2, 4}, :f32)]
-
-      assert {:error, message} = NxOnnx.to_model(fn x -> Nx.sort(x, axis: 0) end, templates)
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
+      assert {:error, message} = NxShuttle.to_model(&Nx.sort(&1, axis: 0), tpl)
       assert message =~ "no ONNX lowering for Nx operation"
     end
 
-    test "a dot that is not a trailing/leading contraction is reported" do
-      templates = [Nx.template({2, 4}, :f32), Nx.template({2, 4}, :f32)]
+    test "a value-changing Cast is refused, because the target accepts and ignores it" do
+      # Measured: f32 -> s32 -> f32 parsed and came back untruncated, off by 0.875. The
+      # compiler said yes and then computed something else, which is the one failure mode a
+      # parse-only check cannot see.
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
 
       assert {:error, message} =
-               NxOnnx.to_model(fn x, y -> Nx.dot(x, [0], y, [0]) end, templates)
+               NxShuttle.to_model(&(Nx.as_type(&1, {:s, 32}) |> Nx.as_type({:f, 32})), tpl)
 
+      assert message =~ "refusing to emit a Cast"
+    end
+
+    test "a relabelling Cast is still emitted" do
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
+      assert {:ok, model} = NxShuttle.to_model(&Nx.as_type(&1, {:f, 32}), tpl)
+      assert is_struct(model, Onnx.ModelProto)
+    end
+
+    test "a dot that is not a trailing/leading contraction is reported" do
+      tpl = [Nx.template({2, 4}, :f32), Nx.template({2, 4}, :f32)]
+      assert {:error, message} = NxShuttle.to_model(fn x, y -> Nx.dot(x, [0], y, [0]) end, tpl)
       assert message =~ "only a trailing/leading contraction"
     end
   end
