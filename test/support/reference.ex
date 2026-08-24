@@ -18,19 +18,16 @@ defmodule NxShuttle.Reference do
   alias NxShuttle.DFC
 
   @doc """
-  Returns `{:ok, engine}` for the best available reference, or `{:error, reasons}`.
-  """
-  def engine do
-    case DFC.available() do
-      :ok ->
-        {:ok, :dfc}
+  Every engine that can run here, and a reason for each that cannot.
 
-      {:error, dfc_why} ->
-        case ortex_available() do
-          :ok -> {:ok, {:ortex, dfc_why}}
-          {:error, ortex_why} -> {:error, {dfc_why, ortex_why}}
-        end
-    end
+  Both are DEPLOYMENT targets, so this returns all of them rather than picking one. A defect
+  that only shows up as a disagreement between them -- the cast above -- is invisible to a
+  check that runs whichever happened to be available.
+  """
+  def engines do
+    checks = [{:dfc, DFC.available()}, {:ortex, ortex_available()}]
+    {ok, missing} = Enum.split_with(checks, fn {_e, r} -> r == :ok end)
+    {Enum.map(ok, &elem(&1, 0)), Enum.map(missing, fn {e, {:error, w}} -> {e, w} end)}
   end
 
   @doc """
@@ -39,6 +36,8 @@ defmodule NxShuttle.Reference do
   Returns a map of name to `{:ok, tensor}` or `{:error, reason}`, in Nx's own layout.
   """
   def run(:dfc, cases), do: DFC.run(cases)
+
+  def run(:ortex, cases), do: run({:ortex, nil}, cases)
 
   def run({:ortex, _}, cases) do
     Map.new(cases, fn %{name: name, model: model, input: input} ->
@@ -58,27 +57,43 @@ defmodule NxShuttle.Reference do
   end
 
   @doc """
-  A one-line description of what a green run actually proved.
+  What a green run actually proved, given which engines ran.
   """
-  def caveat(:dfc), do: "measured against the Dataflow Compiler's own emulator (authoritative)"
+  def caveat([:dfc, :ortex]),
+    do: "both deployment targets ran and were cross-checked against each other"
 
-  def caveat({:ortex, why}),
+  def caveat([:dfc]),
     do:
-      "FALLBACK: measured against ONNX Runtime only, because the compiler is unavailable " <>
-        "(#{why}). This proves the arithmetic, NOT that the toolchain accepts the graph."
+      "PRIMARY ONLY: the accelerator toolchain ran. Nothing was cross-checked, so a graph " <>
+        "that deploys differently on the backup runtime would not show here."
 
-  # Ortex is a Rustler NIF and `Ortex.load/1` ABORTS THE VM on windows-x86_64 rather than
-  # returning an error, so it cannot be probed by trying it -- a failed probe would take the
-  # test run with it. The platform is checked instead, which is a coarser test and a safe one.
+  def caveat([:ortex]),
+    do:
+      "BACKUP ONLY: ONNX Runtime ran. This proves the arithmetic, NOT that the accelerator " <>
+        "toolchain accepts the graph."
+
+  def caveat([]), do: "NOTHING RAN"
+
+  # RETRACTED: an earlier version refused ortex on windows-x86_64, claiming `Ortex.load/1`
+  # aborts the VM. That was ortex 0.1.7, which links ONNX Runtime DYNAMICALLY and died when
+  # `onnxruntime.dll` was not beside the NIF. 0.1.10 links it statically -- one 18.5 MB
+  # `libortex.dll` and no separate library -- and loads and runs here, max|diff| 0.0. The
+  # platform check is gone; availability is decided by whether the module is there.
   defp ortex_available do
-    case :os.type() do
-      {:win32, _} ->
-        {:error, "ortex aborts the BEAM on windows-x86_64, so it cannot stand in here"}
-
-      _ ->
-        if Code.ensure_loaded?(Ortex),
-          do: :ok,
-          else: {:error, "ortex is not compiled into this environment"}
-    end
+    if Code.ensure_loaded?(Ortex),
+      do: :ok,
+      else: {:error, "ortex is not compiled into this environment"}
   end
+
+  @doc """
+  The highest ONNX opset each engine can load, measured rather than declared.
+
+  Ortex bundles its own ONNX Runtime through the `ort` crate, so its ceiling is fixed at build
+  time and cannot be raised from mix.exs. Measured on 0.1.10: 21 loads, 22 does not. The
+  compiler parsed 23. The emitter defaults to 17, which is under both, so nothing is currently
+  blocked -- but a graph needing 22 would deploy to the accelerator and not to the backup, and
+  that is the kind of thing that should fail a check rather than surface in production.
+  """
+  def opset_ceiling(:ortex), do: 21
+  def opset_ceiling(:dfc), do: 23
 end

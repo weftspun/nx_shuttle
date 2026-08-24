@@ -20,34 +20,36 @@ defmodule NxShuttle.LoweringTest do
     # An unmet precondition is a FAIL, not a skip. A suite that quietly runs zero comparisons
     # reports the same green as one that ran them all, and this reference is the kind that goes
     # missing: it needs a licensed wheel and a multi-gigabyte image.
-    case Reference.engine() do
-      {:ok, engine} ->
-        IO.puts("
-  " <> Reference.caveat(engine))
-        {:ok, engine: engine}
+    {engines, missing} = Reference.engines()
 
-      {:error, {dfc_why, ortex_why}} ->
-        raise """
-        Nothing can be measured here. Neither reference is runnable:
+    if engines == [] do
+      raise """
+      Nothing can be measured here. No deployment target is runnable:
 
-          Dataflow Compiler: #{dfc_why}
-          ONNX Runtime:      #{ortex_why}
+      #{Enum.map_join(missing, "
+", fn {e, why} -> "  #{e}: #{why}" end)}
 
-        The compiler is the authoritative one; build it with deploy/hailo-dfc/build.sh in
-        weftspun/rf-detr-cpp. It needs the licensed wheel from hailo.ai, which is not
-        redistributable and is in no repository.
-        """
+      The compiler is the primary target; build it with deploy/hailo-dfc/build.sh in
+      weftspun/rf-detr-cpp. It needs the licensed wheel from hailo.ai, which is not
+      redistributable and is in no repository.
+      """
     end
+
+    IO.puts("
+  " <> Reference.caveat(engines))
+    Enum.each(missing, fn {e, why} -> IO.puts("  not run: #{e} -- #{why}") end)
+    {:ok, engines: engines}
   end
 
-  defp compile_all(engine, cases) do
+  defp compile_all(engines, cases) do
     tpl = [Nx.template(Nx.shape(@x), Nx.type(@x))]
 
-    cases
-    |> Enum.map(fn {name, fun} ->
-      %{name: name, model: NxShuttle.encode(NxShuttle.to_model!(fun, tpl)), input: @x}
-    end)
-    |> then(&Reference.run(engine, &1))
+    built =
+      Enum.map(cases, fn {name, fun} ->
+        %{name: name, model: NxShuttle.encode(NxShuttle.to_model!(fun, tpl)), input: @x}
+      end)
+
+    Map.new(engines, fn e -> {e, Reference.run(e, built)} end)
   end
 
   defp cases do
@@ -63,83 +65,104 @@ defmodule NxShuttle.LoweringTest do
     ]
   end
 
-  describe "what the Dataflow Compiler accepts, and whether it computes what Nx does" do
-    test "each operator, against the chosen reference", %{engine: engine} do
+  describe "every deployment target, and whether they agree with each other" do
+    test "each operator, on each target", %{engines: engines} do
       cs = cases()
-      results = compile_all(engine, cs)
+      per_engine = compile_all(engines, cs)
       funs = Map.new(cs)
 
       rows =
-        Enum.map(cs, fn {name, _} ->
-          case results[name] do
-            {:ok, got} ->
-              expected = funs[name].(@x)
+        for engine <- engines, {name, _} <- cs do
+          verdict =
+            case per_engine[engine][name] do
+              {:ok, got} ->
+                diff =
+                  Nx.subtract(got, funs[name].(@x))
+                  |> Nx.abs()
+                  |> Nx.reduce_max()
+                  |> Nx.to_number()
 
-              diff =
-                Nx.subtract(got, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+                if diff <= 1.0e-5, do: {:agrees, diff}, else: {:disagrees, diff}
 
-              {name, if(diff <= 1.0e-5, do: :agrees, else: {:disagrees, diff}), diff}
+              {:error, why} ->
+                {:rejected, why}
+            end
 
-            {:error, why} ->
-              {name, :rejected, why}
+          {engine, name, verdict}
+        end
+
+      IO.puts("
+  target  operator   verdict")
+
+      Enum.each(rows, fn {e, n, v} ->
+        text =
+          case v do
+            {:agrees, d} -> "agrees (max|diff| #{d})"
+            {:disagrees, d} -> "DISAGREES by #{d}"
+            {:rejected, why} -> "rejected: #{String.slice(why, 0, 72)}"
           end
-        end)
 
-      IO.puts("\n  operator   verdict")
-
-      Enum.each(rows, fn
-        {n, :agrees, d} -> IO.puts("  #{String.pad_trailing(n, 10)} agrees (max|diff| #{d})")
-        {n, {:disagrees, d}, _} -> IO.puts("  #{String.pad_trailing(n, 10)} DISAGREES by #{d}")
-        {n, :rejected, why} -> IO.puts("  #{String.pad_trailing(n, 10)} rejected: #{String.slice(why, 0, 88)}")
+        IO.puts("  #{String.pad_trailing("#{e}", 7)} #{String.pad_trailing(n, 10)} #{text}")
       end)
 
-      # Operators the compiler refuses are a fact about the target, not a defect here, and they
-      # are named rather than counted as passes. What must never happen is a graph it accepts
-      # and then computes differently from Nx: that is the lowering being wrong.
-      wrong = for {n, {:disagrees, d}, _} <- rows, do: "#{n} by #{d}"
-      assert wrong == [], "the compiler accepted these and computed something else: #{inspect(wrong)}"
+      # A target refusing an operator is a fact about that target, named rather than counted as
+      # a pass. What must never happen is a target ACCEPTING a graph and computing something
+      # else: that is the lowering being wrong, and it is the one thing a parse check misses.
+      wrong = for {e, n, {:disagrees, d}} <- rows, do: "#{e}/#{n} by #{d}"
+      assert wrong == [], "accepted and computed something else: #{inspect(wrong)}"
 
-      accepted = for {n, :agrees, _} <- rows, do: n
-      assert accepted != [], "the compiler accepted nothing, so nothing was measured"
-      IO.puts("\n  #{length(accepted)}/#{length(cs)} accepted and agreeing: #{Enum.join(accepted, " ")}")
+      accepted = for {e, n, {:agrees, _}} <- rows, do: {e, n}
+      assert accepted != [], "no target accepted anything, so nothing was measured"
+
+      # THE CROSS-CHECK, and the reason both targets run rather than whichever was handy. An
+      # operator one target deploys and the other refuses means the model runs on the primary
+      # and not the backup, or the reverse. That is a portability fact, and it should be read
+      # off a table rather than discovered when the backup is needed.
+      if length(engines) > 1 do
+        split =
+          for {n, rs} <- Enum.group_by(rows, fn {_e, n, _v} -> n end),
+              ok = for({e, _, {:agrees, _}} <- rs, do: e),
+              no = for({e, _, {:rejected, _}} <- rs, do: e),
+              ok != [] and no != [],
+              do: "#{n}: deploys on #{inspect(ok)}, refused by #{inspect(no)}"
+
+        if split != [] do
+          IO.puts("
+  NOT PORTABLE across targets:")
+          Enum.each(split, &IO.puts("    " <> &1))
+        end
+      end
+
+      IO.puts("
+  #{length(accepted)} target/operator pairs agreeing")
     end
   end
 
   describe "negative controls" do
-    test "a subtraction lowered with its operands swapped must NOT agree", %{engine: engine} do
+    test "a subtraction with its operands swapped must NOT agree", %{engines: engines} do
       # Sub is not commutative, so a reversed lowering is exactly the class of bug the
-      # agreement test above exists to catch. If this passes, that test is decoration.
+      # agreement test exists to catch. If this passes, that test is decoration.
       tpl = [Nx.template(Nx.shape(@x), Nx.type(@x))]
       swapped = fn t -> Nx.subtract(Nx.multiply(t, 0.0) |> Nx.add(0.25), t) end
+      built = [%{name: "swapped", model: NxShuttle.encode(NxShuttle.to_model!(swapped, tpl)), input: @x}]
+      expected = Nx.subtract(@x, 0.25)
 
-      results =
-        Reference.run(engine, [
-          %{name: "swapped", model: NxShuttle.encode(NxShuttle.to_model!(swapped, tpl)), input: @x}
-        ])
-
-      case results["swapped"] do
-        {:ok, got} ->
-          expected = Nx.subtract(@x, 0.25)
+      checked =
+        for engine <- engines, {:ok, got} <- [Reference.run(engine, built)["swapped"]] do
           diff = Nx.subtract(got, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
 
           assert diff > 1.0e-3,
-                 "a swapped subtraction agreed to #{diff}; the comparison cannot see operand order"
+                 "#{engine} agreed to #{diff} on a swapped subtraction; it cannot see operand order"
 
-        {:error, why} ->
-          flunk("the control could not run, so it proves nothing: #{why}")
-      end
+          engine
+        end
+
+      assert checked != [], "no target ran the control, so it proves nothing"
     end
 
-    test "an Nx operation with no lowering is reported, not silently dropped" do
-      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
-      assert {:error, message} = NxShuttle.to_model(&Nx.sort(&1, axis: 0), tpl)
-      assert message =~ "no ONNX lowering for Nx operation"
-    end
-
-    test "a value-changing Cast is refused, because the target accepts and ignores it" do
-      # Measured: f32 -> s32 -> f32 parsed and came back untruncated, off by 0.875. The
-      # compiler said yes and then computed something else, which is the one failure mode a
-      # parse-only check cannot see.
+    test "a value-changing Cast is refused, because a target accepts and ignores it" do
+      # Measured: f32 -> s32 -> f32 parsed on the accelerator toolchain and came back
+      # untruncated, off by 0.875. It said yes and then computed something else.
       tpl = [Nx.template({1, 4, 4, 2}, :f32)]
 
       assert {:error, message} =
@@ -154,33 +177,31 @@ defmodule NxShuttle.LoweringTest do
       assert is_struct(model, Onnx.ModelProto)
     end
 
-    test "when the compiler is missing, the fallback is chosen or the run fails by name" do
-      # The selection rule itself is checked, because a fallback nothing ever takes is a rule
-      # nobody has verified. Pointing at an image that does not exist forces the miss.
-      System.put_env("NX_SHUTTLE_DFC_IMAGE", "nx-shuttle-no-such-image:never")
-
-      try do
-        case Reference.engine() do
-          {:ok, {:ortex, why}} ->
-            assert why =~ "is not built"
-            assert Reference.caveat({:ortex, why}) =~ "FALLBACK"
-
-          {:error, {dfc_why, ortex_why}} ->
-            assert dfc_why =~ "is not built"
-            assert ortex_why != ""
-
-          {:ok, :dfc} ->
-            flunk("the compiler was selected despite pointing at an image that does not exist")
-        end
-      after
-        System.delete_env("NX_SHUTTLE_DFC_IMAGE")
-      end
+    test "an Nx operation with no lowering is reported, not silently dropped" do
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
+      assert {:error, message} = NxShuttle.to_model(&Nx.sort(&1, axis: 0), tpl)
+      assert message =~ "no ONNX lowering for Nx operation"
     end
 
     test "a dot that is not a trailing/leading contraction is reported" do
       tpl = [Nx.template({2, 4}, :f32), Nx.template({2, 4}, :f32)]
       assert {:error, message} = NxShuttle.to_model(fn x, y -> Nx.dot(x, [0], y, [0]) end, tpl)
       assert message =~ "only a trailing/leading contraction"
+    end
+
+    test "when a target is missing, it is named rather than assumed absent" do
+      # A fallback nothing ever takes is a rule nobody has verified. Pointing at an image that
+      # does not exist forces the miss.
+      System.put_env("NX_SHUTTLE_DFC_IMAGE", "nx-shuttle-no-such-image:never")
+
+      try do
+        {engines, missing} = Reference.engines()
+        refute :dfc in engines, "the compiler was selected despite a nonexistent image"
+        assert {:dfc, why} = List.keyfind(missing, :dfc, 0)
+        assert why =~ "is not built"
+      after
+        System.delete_env("NX_SHUTTLE_DFC_IMAGE")
+      end
     end
   end
 end
