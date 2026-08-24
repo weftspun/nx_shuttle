@@ -22,7 +22,8 @@ defmodule NxShuttle.DFC do
   Returns `:ok` when the compiler can actually be run, `{:error, reason}` otherwise.
   """
   def available do
-    with {_, 0} <- System.cmd("docker", ["version", "--format", "{{.Server.Os}}"], stderr_to_stdout: true),
+    with {_, 0} <-
+           System.cmd("docker", ["version", "--format", "{{.Server.Os}}"], stderr_to_stdout: true),
          {out, 0} <-
            System.cmd("docker", ["images", "-q", image()], stderr_to_stdout: true) do
       if String.trim(out) == "", do: {:error, "docker image #{image()} is not built"}, else: :ok
