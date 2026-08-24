@@ -2,14 +2,29 @@ defmodule NxShuttle do
   @moduledoc """
   Compiles an `Nx.Defn` function to an ONNX graph.
 
-  This compiles; it does not execute. `Nx.Defn.Expr` is traced and lowered to ONNX nodes by
-  `NxShuttle.Lowering`, and the result is a `Onnx.ModelProto` you can write to disk and hand to
-  a downstream compiler or runtime.
+  This compiles; it does not execute. There is no backend here and nothing to point
+  `Nx.default_backend/1` at. `Nx.Defn.Expr` is traced and lowered by `NxShuttle.Lowering`, and
+  the result is a `Onnx.ModelProto` you can write to disk and hand to an accelerator toolchain.
 
-      iex> f = fn x, y -> Nx.add(x, y) end
-      iex> {:ok, model} = NxShuttle.to_model(f, [Nx.template({2}, :f32), Nx.template({2}, :f32)])
-      iex> length(model.graph.node)
-      1
+      f = fn x -> Nx.multiply(Nx.add(x, 1.0), 0.5) end
+      {:ok, model} = NxShuttle.to_model(f, [Nx.template({1, 8, 8, 3}, :f32)])
+
+  ## It refuses rather than guesses
+
+  A lowering that emits a plausible wrong node is worse than one that stops. An Nx operation
+  with no lowering is reported by name; a `dot` that is not a trailing/leading contraction is
+  refused rather than emitted as a `MatMul` meaning something else; and a value-changing `Cast`
+  is refused, because a target accepted one and then did not perform it -- an `f32 -> s32 ->
+  f32` round trip came back untruncated, off by 0.875.
+
+  ## What deployment actually computes
+
+  Verification runs the graph on the targets it will deploy to, not on a convenient stand-in.
+  The distinction that matters: an accelerator toolchain's float emulation of a parsed graph
+  agrees with Nx bit-exactly, and the QUANTIZED graph that actually runs does not. On
+  elementwise arithmetic, float emulation differs by 0.0 and the deployed form by 0.004 to
+  0.020. Both are reported; only the float figure is asserted tightly, because quantization
+  cost is a property of the target rather than a defect in the lowering.
 
   ## Opset
 

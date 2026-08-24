@@ -41,6 +41,9 @@ defmodule NxShuttle.LoweringTest do
     {:ok, engines: engines}
   end
 
+  defp fmt(f) when is_float(f), do: :erlang.float_to_binary(f, [{:decimals, 6}, :compact])
+  defp fmt(other), do: inspect(other)
+
   defp compile_all(engines, cases) do
     tpl = [Nx.template(Nx.shape(@x), Nx.type(@x))]
 
@@ -73,15 +76,19 @@ defmodule NxShuttle.LoweringTest do
 
       rows =
         for engine <- engines, {name, _} <- cs do
+          expected = funs[name].(@x)
+          d = fn t -> Nx.subtract(t, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number() end
+
           verdict =
             case per_engine[engine][name] do
-              {:ok, got} ->
-                diff =
-                  Nx.subtract(got, funs[name].(@x))
-                  |> Nx.abs()
-                  |> Nx.reduce_max()
-                  |> Nx.to_number()
+              # The primary reports twice: the float emulation says whether the lowering is
+              # structurally right, the quantized one says what deployment will actually
+              # compute. They are different questions and get different tolerances.
+              {:ok, %{native: native, bit_exact: exact}} ->
+                {:two, d.(native), d.(exact)}
 
+              {:ok, got} ->
+                diff = d.(got)
                 if diff <= 1.0e-5, do: {:agrees, diff}, else: {:disagrees, diff}
 
               {:error, why} ->
@@ -97,9 +104,12 @@ defmodule NxShuttle.LoweringTest do
       Enum.each(rows, fn {e, n, v} ->
         text =
           case v do
-            {:agrees, d} -> "agrees (max|diff| #{d})"
-            {:disagrees, d} -> "DISAGREES by #{d}"
-            {:rejected, why} -> "rejected: #{String.slice(why, 0, 72)}"
+            {:two, nat, exact} ->
+              "float #{fmt(nat)} | quantized #{fmt(exact)}"
+
+            {:agrees, d} -> "agrees (max|diff| #{fmt(d)})"
+            {:disagrees, d} -> "DISAGREES by #{fmt(d)}"
+            {:rejected, why} -> "rejected: #{String.slice(why, 0, 60)}"
           end
 
         IO.puts("  #{String.pad_trailing("#{e}", 7)} #{String.pad_trailing(n, 10)} #{text}")
@@ -108,10 +118,28 @@ defmodule NxShuttle.LoweringTest do
       # A target refusing an operator is a fact about that target, named rather than counted as
       # a pass. What must never happen is a target ACCEPTING a graph and computing something
       # else: that is the lowering being wrong, and it is the one thing a parse check misses.
-      wrong = for {e, n, {:disagrees, d}} <- rows, do: "#{e}/#{n} by #{d}"
-      assert wrong == [], "accepted and computed something else: #{inspect(wrong)}"
+      # The lowering is wrong only if the FLOAT path disagrees. Quantization error is a
+      # property of the target and is reported, not asserted away.
+      wrong =
+        for {e, n, v} <- rows,
+            d = case(v, do: ({:disagrees, x} -> x; {:two, x, _} when x > 1.0e-5 -> x; _ -> nil)),
+            d != nil,
+            do: "#{e}/#{n} by #{d}"
 
-      accepted = for {e, n, {:agrees, _}} <- rows, do: {e, n}
+      assert wrong == [], "accepted and computed something else in float: #{inspect(wrong)}"
+
+      quantization =
+        for {_e, n, {:two, _nat, exact}} <- rows, do: {n, exact}
+
+      if quantization != [] do
+        worst = quantization |> Enum.max_by(&elem(&1, 1))
+        IO.puts("
+  quantization cost on the primary, worst: #{elem(worst, 0)} at #{fmt(elem(worst, 1))}")
+        IO.puts("  (the float emulation agrees; this is what the accelerator will actually compute)")
+      end
+
+      accepted =
+        for {e, n, v} <- rows, match?({:agrees, _}, v) or match?({:two, _, _}, v), do: {e, n}
       assert accepted != [], "no target accepted anything, so nothing was measured"
 
       # THE CROSS-CHECK, and the reason both targets run rather than whichever was handy. An
@@ -148,7 +176,8 @@ defmodule NxShuttle.LoweringTest do
       expected = Nx.subtract(@x, 0.25)
 
       checked =
-        for engine <- engines, {:ok, got} <- [Reference.run(engine, built)["swapped"]] do
+        for engine <- engines, {:ok, res} <- [Reference.run(engine, built)["swapped"]] do
+          got = if is_map(res) and is_map_key(res, :native), do: res.native, else: res
           diff = Nx.subtract(got, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
 
           assert diff > 1.0e-3,

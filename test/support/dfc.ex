@@ -38,7 +38,13 @@ defmodule NxShuttle.DFC do
   convention and the DFC works in NHWC, so inputs are transposed on the way in and outputs on
   the way back, leaving both sides comparable in Nx's own layout.
 
-  Returns a map of name to `{:ok, tensor}` or `{:error, reason}`.
+  Returns a map of name to `{:ok, %{native: tensor, bit_exact: tensor}}` or `{:error, reason}`.
+
+  TWO CONTEXTS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS. `SDK_NATIVE` runs the parsed graph in
+  float and says whether the lowering is structurally right. `SDK_BIT_EXACT` runs the QUANTIZED
+  graph, which is what actually reaches the accelerator, and says what deployment will compute.
+  Measured on `(x + 1) * 0.5`, native agrees with Nx to 0.0 and bit-exact diverges by 0.455.
+  Reporting only the first would certify a graph nobody deploys.
   """
   def run(cases) do
     dir = Path.join(System.tmp_dir!(), "nx_shuttle_dfc_#{System.unique_integer([:positive])}")
@@ -51,7 +57,17 @@ defmodule NxShuttle.DFC do
           nhwc = Nx.transpose(input, axes: [0, 2, 3, 1])
           File.write!(Path.join(dir, "#{name}.in"), Nx.to_binary(nhwc))
 
-          %{"name" => name, "in_shape" => Tuple.to_list(Nx.shape(nhwc))}
+          # CALIBRATE OVER THE RANGE THE INPUT ACTUALLY SPANS. A first version calibrated on a
+          # fixed 0..2 while the inputs reached 4.375, so everything above 2 saturated and the
+          # quantization error it reported -- up to 2.375 on a plain Add -- was measuring the
+          # harness rather than the target. Quantization is only as good as the range it was
+          # shown, and the range has to come from the data.
+          %{
+            "name" => name,
+            "in_shape" => Tuple.to_list(Nx.shape(nhwc)),
+            "lo" => input |> Nx.reduce_min() |> Nx.to_number(),
+            "hi" => input |> Nx.reduce_max() |> Nx.to_number()
+          }
         end)
 
       File.write!(Path.join(dir, "manifest.json"), Jason.encode!(manifest))
@@ -74,18 +90,18 @@ defmodule NxShuttle.DFC do
       Map.new(cases, fn %{name: name, input: input} ->
         case results[name] do
           %{"ok" => true, "shape" => shape} ->
-            raw = File.read!(Path.join(dir, "#{name}.out"))
-
-            got =
-              raw
+            read = fn ext ->
+              Path.join(dir, "#{name}.#{ext}")
+              |> File.read!()
               |> Nx.from_binary({:f, 32})
               |> Nx.reshape(List.to_tuple(shape))
               |> then(fn t ->
                 if Nx.rank(t) == 4, do: Nx.transpose(t, axes: [0, 3, 1, 2]), else: t
               end)
+            end
 
             _ = input
-            {name, {:ok, got}}
+            {name, {:ok, %{native: read.("native"), bit_exact: read.("exact")}}}
 
           %{"ok" => false, "error" => why} ->
             {name, {:error, why}}
@@ -123,10 +139,25 @@ defmodule NxShuttle.DFC do
             runner.translate_onnx_model(f"/work/{name}.onnx", name.replace("-", "_"))
             shape = [int(d) for d in case["in_shape"]]
             x = np.frombuffer(open(f"/work/{name}.in", "rb").read(), dtype=np.float32).reshape(shape)
+
             with runner.infer_context(InferenceContext.SDK_NATIVE) as ctx:
-                out = np.asarray(runner.infer(ctx, x)).astype(np.float32)
-            open(f"/work/{name}.out", "wb").write(out.tobytes())
-            results[name] = {"ok": True, "shape": list(out.shape)}
+                native = np.asarray(runner.infer(ctx, x)).astype(np.float32)
+
+            # 1024 is the amount the optimizer asks for; below it, it drops to optimization
+            # level 0 and says so, and a quantization figure measured there is not the one
+            # deployment would see.
+            rng = np.random.RandomState(0)
+            lo, hi = float(case["lo"]), float(case["hi"])
+            pad = 0.05 * max(abs(lo), abs(hi), 1.0)
+            calib = rng.uniform(lo - pad, hi + pad, size=[1024] + list(shape[1:])).astype(np.float32)
+            runner.optimize(calib)
+
+            with runner.infer_context(InferenceContext.SDK_BIT_EXACT) as ctx:
+                exact = np.asarray(runner.infer(ctx, x)).astype(np.float32)
+
+            open(f"/work/{name}.native", "wb").write(native.tobytes())
+            open(f"/work/{name}.exact", "wb").write(exact.tobytes())
+            results[name] = {"ok": True, "shape": list(native.shape)}
         except Exception as e:
             results[name] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}"}
 

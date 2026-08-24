@@ -2,7 +2,7 @@ defmodule AxonOnnx.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/weftspun/nx_shuttle"
-  @version "0.4.0"
+  @version "0.1.0"
 
   def project do
     [
@@ -59,7 +59,7 @@ defmodule AxonOnnx.MixProject do
 
   defp package do
     [
-      maintainers: ["Sean Moriarity"],
+      maintainers: ["weftspun"],
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url}
     ]
