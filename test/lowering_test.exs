@@ -64,8 +64,28 @@ defmodule NxShuttle.LoweringTest do
       {"add_mul", &Nx.multiply(Nx.add(&1, 1.0), 0.5)},
       {"sqrt", &Nx.sqrt/1},
       {"erf", &Nx.erf/1},
-      {"where", &Nx.select(Nx.equal(&1, &1), Nx.multiply(&1, 2.0), &1)}
+      {"where", &Nx.select(Nx.equal(&1, &1), Nx.multiply(&1, 2.0), &1)},
+      # DOES THE RESIDUAL ACCUMULATE? Each link is arithmetically the identity, so a chain of
+      # them has the same float answer as one. Anything the quantized graph adds along the way
+      # is the noise compounding, and depth is the axis nobody measures on a single operator.
+      {"chain1", &chain(&1, 1)},
+      {"chain2", &chain(&1, 2)},
+      {"chain4", &chain(&1, 4)},
+      {"chain8", &chain(&1, 8)}
     ]
+  end
+
+  # RETRACTED AND REPLACED. The first version chained affine links -- (x+1)*0.5*2-1 -- and
+  # reported byte-identical residuals at depths 1, 2, 4 and 8. That was not noise cancelling,
+  # it was the compiler FOLDING the chain into the same two-layer graph, and the flat line was
+  # evidence about the optimizer rather than about accumulation.
+  #
+  # `sqrt` is not affine, so the folder cannot collapse these. Each link is a real quantization
+  # boundary and depth is finally the thing being varied.
+  defp chain(x, n) do
+    Enum.reduce(1..n//1, x, fn _, acc ->
+      acc |> Nx.multiply(acc) |> Nx.add(0.01) |> Nx.sqrt()
+    end)
   end
 
   describe "every deployment target, and whether they agree with each other" do
@@ -85,7 +105,13 @@ defmodule NxShuttle.LoweringTest do
               # structurally right, the quantized one says what deployment will actually
               # compute. They are different questions and get different tolerances.
               {:ok, %{native: native, bit_exact: exact}} ->
-                {:two, d.(native), d.(exact)}
+                # Decompose the quantization residual. A constant folded into the graph can
+                # only cancel the MEAN; the spread around it is rounding noise and no emission
+                # choice removes it. Reporting max alone cannot tell those apart.
+                r = Nx.subtract(exact, expected)
+                mean = r |> Nx.mean() |> Nx.to_number()
+                sd = r |> Nx.standard_deviation() |> Nx.to_number()
+                {:two, d.(native), d.(exact), mean, sd}
 
               {:ok, got} ->
                 diff = d.(got)
@@ -104,8 +130,11 @@ defmodule NxShuttle.LoweringTest do
       Enum.each(rows, fn {e, n, v} ->
         text =
           case v do
-            {:two, nat, exact} ->
-              "float #{fmt(nat)} | quantized #{fmt(exact)}"
+            {:two, nat, exact, mean, sd} ->
+              share = if exact > 0.0, do: abs(mean) / exact * 100.0, else: 0.0
+
+              "float #{fmt(nat)} | quantized max #{fmt(exact)} bias #{fmt(mean)} " <>
+                "sd #{fmt(sd)} (bias is #{fmt(share)}% of max)"
 
             {:agrees, d} -> "agrees (max|diff| #{fmt(d)})"
             {:disagrees, d} -> "DISAGREES by #{fmt(d)}"
@@ -122,24 +151,31 @@ defmodule NxShuttle.LoweringTest do
       # property of the target and is reported, not asserted away.
       wrong =
         for {e, n, v} <- rows,
-            d = case(v, do: ({:disagrees, x} -> x; {:two, x, _} when x > 1.0e-5 -> x; _ -> nil)),
+            d = case(v, do: ({:disagrees, x} -> x; {:two, x, _, _, _} when x > 1.0e-5 -> x; _ -> nil)),
             d != nil,
             do: "#{e}/#{n} by #{d}"
 
       assert wrong == [], "accepted and computed something else in float: #{inspect(wrong)}"
 
       quantization =
-        for {_e, n, {:two, _nat, exact}} <- rows, do: {n, exact}
+        for {_e, n, {:two, _nat, exact, mean, sd}} <- rows, do: {n, exact, mean, sd}
 
       if quantization != [] do
-        worst = quantization |> Enum.max_by(&elem(&1, 1))
+        {n, mx, mean, sd} = Enum.max_by(quantization, &elem(&1, 1))
         IO.puts("
-  quantization cost on the primary, worst: #{elem(worst, 0)} at #{fmt(elem(worst, 1))}")
-        IO.puts("  (the float emulation agrees; this is what the accelerator will actually compute)")
+  worst quantization residual: #{n}, max #{fmt(mx)}, bias #{fmt(mean)}, sd #{fmt(sd)}")
+
+        correctable =
+          Enum.count(quantization, fn {_n, _mx, m, s} -> s > 0.0 and abs(m) > 0.5 * s end)
+
+        IO.puts(
+          "  #{correctable}/#{length(quantization)} residuals are bias-dominated (|mean| > sd/2), " <>
+            "which is the part a folded correction could remove"
+        )
       end
 
       accepted =
-        for {e, n, v} <- rows, match?({:agrees, _}, v) or match?({:two, _, _}, v), do: {e, n}
+        for {e, n, v} <- rows, match?({:agrees, _}, v) or match?({:two, _, _, _, _}, v), do: {e, n}
       assert accepted != [], "no target accepted anything, so nothing was measured"
 
       # THE CROSS-CHECK, and the reason both targets run rather than whichever was handy. An

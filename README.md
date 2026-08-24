@@ -69,6 +69,36 @@ that matters most is the one where they differ. Measured, eight operators on bot
 the accelerator. The suite prints that table rather than leaving it to be discovered when the
 primary path is the one being shipped.
 
+#### Supported, accepted, and folded are three different things
+
+The compiler documents its operators in **two** tables, and reading only the first is a
+mistake worth naming because it produced two wrong conclusions here. Table 3 is layers; Table 4
+is activations. `Sqrt` and `Sigmoid` are absent from Table 3 and present in Table 4, so they
+are supported and a Table-3-only reading calls them unsupported.
+
+Worse, some operators are documented **only as a pattern**. `Erf` appears in neither table
+alone; Table 4 reaches it through `Gelu (preview)`, whose ONNX form is `Mul, Erf`. So a bare
+`Erf` is refused and an `Erf` inside a GELU is compiled -- which is why a real export contains
+twelve of them and the one this suite emits standalone is rejected. The same holds for `SiLU`
+(`Mul, Sigmoid`), hard-swish and Mish.
+
+And a third category exists that no table describes. Comparing a passing 825-node export
+against both tables, **twelve operators pass while being documented nowhere**:
+
+    Cast Constant ConstantOfShape Expand Flatten Gather Identity Range
+    Shape Squeeze Unsqueeze Where
+
+These are shape plumbing, and they pass because a fixed-resolution graph **folds them away**
+before anything reaches hardware -- not because they are implemented. That is a fragile kind of
+support: `Where` is in that list from a real export, and the standalone `Where` this suite
+emits is refused, because there is nothing to fold it into. `Cast` is the sharpest case,
+accepted and then not performed.
+
+So the rule this package works to: emit what the tables document, prefer the pattern form where
+one exists, and treat "it compiled once" as weaker evidence than "it is in a table".
+`weftspun/rf-detr-cpp`'s `scripts/hailo_supported_ops.py` carries both tables and computes
+this delta.
+
 ### The primary is measured after quantization, not before
 
 This is the part that is easy to get wrong. The compiler's `SDK_NATIVE` context runs the parsed
@@ -95,6 +125,39 @@ entirely an artefact of the harness. The range now comes from the input's own mi
 1024 entries, which is what the optimizer asks for: below that it drops to optimization level 0
 and says so, and a number measured there is not one you would ship.
 
+### Quantization is reducible, but not by anything the emitter can do
+
+The residual above is **zero-mean rounding noise, not a systematic bias** — measured across six
+operators, `|mean|` is 2% to 35% of the standard deviation, and none is bias-dominated. So a
+correction folded into the graph at emission has nothing to cancel. We control both sides and
+it does not help; the error is dither, not offset.
+
+What does move it is the compiler's precision mode, measured on `(x + 1) * 0.5 - 0.25`:
+
+| configuration | max residual | vs baseline |
+| --- | --- | --- |
+| `a8_w8` (default) | 0.008946 | — |
+| **`a16_w16` whole model** | **0.000071** | **126x** |
+| selective, `p/normalization1` | 0.004537 | 2.0x |
+| selective, `p/output_layer1` | 0.005935 | 1.5x |
+
+Two things worth knowing before reaching for it. **Selective 16-bit is not a cheap substitute**:
+the layer carrying most of the error, `p/mul_and_add1`, appears in `get_hn_dict()` but
+`quantization_param` reports it not found even fully qualified, and the wildcard form is
+rejected by the script parser. And **`a16_w8` and `a16_w4` do not work here** — the 5.3.0
+release notes announce them as preview for Hailo-10H, and the compiler rejects both with
+`Unsupported value [PrecisionMode.a16_w8] for fields ['precision_mode']`. The mode that works
+is `a16_w16` applied whole-model through
+`model_optimization_config(compression_params, auto_16bit_weights_ratio=1)`.
+
+Whether 16-bit is affordable is a throughput question rather than a memory one. The module
+carries 4-8 GB of LPDDR4 and the accelerator has direct DRAM access, so a backbone whose
+weights are ~25 MB at int8 and ~51 MB at int16 occupies about 1% of the smallest
+configuration. The cost lands on bandwidth -- LPDDR4 32-bit at 4266 MT/s is about 17 GB/s, so
+doubling the bytes halves a streaming-bound ceiling -- and on compute, where the datasheet
+publishes 40 INT4 TOPS and the compiler guide 20 TOPS at 8-bit and **neither publishes a
+16-bit figure**.
+
 ## Opset
 
 Defaults to **17**, chosen by measurement rather than from a table. Neither consumer
@@ -115,6 +178,14 @@ would be 15.
 
 `NxShuttle.Reference.opset_ceiling/1` records both targets' ceilings, so a graph that would
 deploy to the accelerator but not to the backup fails a check instead of surfacing later.
+
+## IR version
+
+Emitted at **ir_version 10**, pinned rather than inherited. The accelerator toolchain's bundled
+checker refuses anything higher, and the current `onnx` python package defaults to 13 -- so a
+graph built with library defaults is rejected before any operator is examined, with an error
+about the checker rather than about the graph. That is not a hypothetical: it is how the
+spec-versus-device equivalence check first failed.
 
 ## Rank and layout
 

@@ -56,7 +56,13 @@ defmodule NxShuttle do
   alias Onnx.TensorShapeProto.Dimension, as: Dimension
 
   @default_opset 17
-  @ir_version 8
+  # PINNED, NOT INHERITED, and 10 rather than higher. The accelerator toolchain's bundled
+  # checker refuses anything above ir_version 10: a graph emitted at 13 -- which is what the
+  # current onnx python package defaults to -- is rejected before a single operator is looked
+  # at, with a message about the checker rather than about the model. Emitting the ceiling
+  # rather than the default is the difference between a graph that reaches the parser and one
+  # that does not.
+  @ir_version 10
 
   @doc """
   Builds an `Onnx.ModelProto` from `fun` applied to `templates`.
