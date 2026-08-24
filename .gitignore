@@ -27,3 +27,5 @@ axon_onnx-*.tar
 
 .test-cache/
 test/cases
+
+/axon-onnx/deps/

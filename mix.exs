@@ -1,19 +1,19 @@
 defmodule AxonOnnx.MixProject do
   use Mix.Project
 
-  @source_url "https://github.com/elixir-nx/axon_onnx"
+  @source_url "https://github.com/weftspun/nx_onnx"
   @version "0.4.0"
 
   def project do
     [
-      app: :axon_onnx,
+      app: :nx_onnx,
       version: @version,
-      name: "AxonOnnx",
+      name: "NxOnnx",
       elixir: "~> 1.13",
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       docs: docs(),
-      description: "Convert models between Axon/ONNX",
+      description: "Compile Nx defn to ONNX",
       package: package(),
       preferred_cli_env: [
         docs: :docs,
@@ -36,11 +36,10 @@ defmodule AxonOnnx.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:axon, "~> 0.5", axon_opts()},
       {:protox, "~> 1.6.10"},
       {:nx, "~> 0.5", nx_opts()},
       {:torchx, "~> 0.13.1"},
-      {:req, "~> 0.1.0", only: :test},
+      {:pythonx, "~> 0.4", only: :test},
       {:jason, "~> 1.2", only: :test},
       {:ex_doc, "~> 0.23", only: :docs}
     ] ++ exla_dep()
@@ -68,22 +67,14 @@ defmodule AxonOnnx.MixProject do
 
   defp docs do
     [
-      main: "AxonOnnx",
+      main: "NxOnnx",
       source_ref: "v#{@version}",
       source_url: @source_url
     ]
   end
 
-  defp axon_opts do
-    if path = System.get_env("AXON_PATH") do
-      [path: path]
-    else
-      []
-    end
-  end
-
   defp nx_opts do
-    if path = System.get_env("AXON_NX_PATH") do
+    if path = System.get_env("NX_ONNX_NX_PATH") do
       [path: path, override: true]
     else
       []

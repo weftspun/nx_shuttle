@@ -1,4 +1,4 @@
-defmodule AxonOnnx.NxLowering do
+defmodule NxOnnx.Lowering do
   @moduledoc false
 
   # Lowers an Nx.Defn.Expr tree to ONNX nodes. Axon's IR names layers, not tensor
@@ -164,7 +164,7 @@ defmodule AxonOnnx.NxLowering do
 
   defp apply_op(op, _args, _t, _params, _state) do
     raise ArgumentError,
-          "AxonOnnx.NxLowering has no ONNX lowering for Nx operation #{inspect(op)}"
+          "NxOnnx.Lowering has no ONNX lowering for Nx operation #{inspect(op)}"
   end
 
   defp simple(op_type, inputs, _t, state) do
