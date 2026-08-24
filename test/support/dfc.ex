@@ -47,7 +47,15 @@ defmodule NxShuttle.DFC do
   Measured on `(x + 1) * 0.5`, native agrees with Nx to 0.0 and bit-exact diverges by 0.455.
   Reporting only the first would certify a graph nobody deploys.
   """
-  def run(cases) do
+  def run(cases), do: run(cases, [])
+
+  @doc """
+  As `run/1`, with `:script` -- a Hailo model script applied before `optimize/1`.
+
+  `precision_script/1` builds the rungs. Nothing is applied by default, which keeps `run/1`
+  reporting what the compiler does when nobody has intervened.
+  """
+  def run(cases, opts) do
     dir = Path.join(System.tmp_dir!(), "nx_shuttle_dfc_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
 
@@ -67,7 +75,8 @@ defmodule NxShuttle.DFC do
             "name" => name,
             "in_shape" => Tuple.to_list(Nx.shape(nhwc)),
             "lo" => input |> Nx.reduce_min() |> Nx.to_number(),
-            "hi" => input |> Nx.reduce_max() |> Nx.to_number()
+            "hi" => input |> Nx.reduce_max() |> Nx.to_number(),
+            "script" => Keyword.get(opts, :script)
           }
         end)
 
@@ -124,6 +133,53 @@ defmodule NxShuttle.DFC do
     end
   end
 
+  @doc """
+  A model script for one rung of the precision ladder, or `nil` for the compiler's own default.
+
+  THE RUNGS THAT EXIST, which is not what the release notes advertise. 5.3.0 announces `a16_w8`
+  and `a16_w4` as Hailo-10H preview and the compiler rejects both outright with
+  `Unsupported value [PrecisionMode.a16_w8] for fields ['precision_mode']`. What is left is one
+  ratio dial and the default.
+
+      :default   whatever optimize() does unaided -- a8_w8
+      :w4        auto_4bit_weights_ratio=1
+      :a16_w16   auto_16bit_weights_ratio=1
+
+  THE DIAL IS NOT WEIGHTS-ONLY, despite its name, and the compiler said so rather than the
+  documentation. Rejecting `pow` under this script it reported the config it had built:
+  `Layer: pow/square1, Config: {'precision_mode': 'a16_w16', ...}`. So
+  `auto_16bit_weights_ratio=1` yields a16_w16, activations included. An earlier version of this
+  function called that rung `:w16` and offered a separate `:a16_w16` that added
+  `optimization_level=2`; that was two names for one precision and a second dial wearing the
+  first one's label. Measured, they differed by 0.000013 on `add` -- the optimization level, not
+  the bit width.
+
+  MEASURED, on `x` over [0.5, 5.375], max |bit_exact - Nx|:
+
+      case      :w4                     :default    :a16_w16
+      add       ZeroDivisionError       0.019428    0.000166
+      sigmoid   ZeroDivisionError       0.007119    0.006048
+      exp       ZeroDivisionError       0.483141    0.333931
+      pow       ZeroDivisionError       0.078688    AccelerasImplementationError
+
+  Three things that table says and a summary would not. `:w4` is not a rung: it fails on every
+  graph here, including `add`, with `ZeroDivisionError: division by zero`. `pow` gets WORSE by
+  going up -- 16-bit is unsupported for its square layer, so its only workable rung is the
+  default. And `exp` is not a precision problem at all: 0.33 at a16_w16 is still unusable, and
+  the cause is dynamic range -- e^0.5 to e^5.375 spans 1.6 to 216 -- which more bits on the
+  weights do not address.
+
+  So there is no single lowest rung. It is per-graph, and `add` improving 117x while `pow`
+  stops compiling is the reason this returns a script rather than picking one.
+  """
+  def precision_script(:default), do: nil
+
+  def precision_script(:w4),
+    do: "model_optimization_config(compression_params, auto_4bit_weights_ratio=1)"
+
+  def precision_script(:a16_w16),
+    do: "model_optimization_config(compression_params, auto_16bit_weights_ratio=1)"
+
   defp runner_py do
     """
     import json, warnings, numpy as np
@@ -151,6 +207,13 @@ defmodule NxShuttle.DFC do
             lo, hi = float(case["lo"]), float(case["hi"])
             pad = 0.05 * max(abs(lo), abs(hi), 1.0)
             calib = rng.uniform(lo - pad, hi + pad, size=[1024] + list(shape[1:])).astype(np.float32)
+            # PRECISION IS A DIAL, and until now it was never turned. optimize() at defaults is
+            # a8_w8. A graph whose arithmetic does not survive that is not necessarily one that
+            # cannot deploy -- it is one that needs more bits. The caller names the rung and the
+            # point is to report the LOWEST that works rather than the safest.
+            script = case.get("script")
+            if script:
+                runner.load_model_script(script)
             runner.optimize(calib)
 
             with runner.infer_context(InferenceContext.SDK_BIT_EXACT) as ctx:
