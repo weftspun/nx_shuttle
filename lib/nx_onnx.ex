@@ -13,9 +13,22 @@ defmodule NxOnnx do
 
   ## Opset
 
-  Defaults to 17. The floor that matters here is 15, which is where the Hailo Dataflow
-  Compiler 5.3.0's supported range begins; 17 is where `LayerNormalization` becomes an
-  operator rather than a decomposition.
+  Defaults to 17, and the reason is expressiveness rather than acceptance. Both consumers
+  were swept and neither distinguishes one opset from another:
+
+      onnxruntime 1.29.0   14 operator cases, opsets 13..24   identical, every cell
+      Hailo DFC 5.3.0      elementwise rank-4 graph           PARSED at 13..23
+
+  The DFC parsed 22 and 23 as readily as 15, though its guide documents 15-21, so the
+  published range is conservative rather than enforced. What the DFC rejects is operators,
+  not versions: the same graph carrying a standalone `Erf` is refused at every opset with
+  `UnsupportedActivationLayerError`, even though a real rf-detr export contains twelve of
+  them inside GELU patterns the parser fuses.
+
+  So the choice is free, and the tie goes to the lowest opset that can still express the
+  whole operator set, because a lower opset is readable by strictly more consumers and
+  nothing measured is bought by going higher. That is 17, where `LayerNormalization` becomes
+  an operator rather than a decomposition. Without it the answer would be 15.
   """
 
   alias Onnx.ModelProto, as: Model

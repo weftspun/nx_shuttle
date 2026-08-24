@@ -9,8 +9,8 @@ version = "0.0.0"
 requires-python = "==3.11.*"
 dependencies = [
   "numpy==2.2.6",
-  "onnx==1.17.0",
-  "onnxruntime==1.20.1"
+  "onnx==1.20.0",
+  "onnxruntime==1.29.0"
 ]
 """)
 
