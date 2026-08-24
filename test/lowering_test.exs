@@ -7,7 +7,7 @@ defmodule NxShuttle.LoweringTest do
   # answer. So the DFC parses each graph and its native emulator runs it, and the number it
   # returns is what the lowering is measured against.
 
-  alias NxShuttle.Reference
+  alias NxShuttle.{DFC, Reference}
 
   # ONNX is NCHW by convention and the DFC works in NHWC, so every case is rank-4 and the
   # transpose happens in DFC.run/1. A rank-2 graph is rejected on its shape, which would read
@@ -287,6 +287,50 @@ defmodule NxShuttle.LoweringTest do
       tpl = [Nx.template({1, 4, 4, 2}, :f32)]
       assert {:error, message} = NxShuttle.to_model(&Nx.sort(&1, axis: 0), tpl)
       assert message =~ "no ONNX lowering for Nx operation"
+    end
+
+    test "Sigmoid is reachable, because its mapping once was not" do
+      # REGRESSION GUARD for a bug that produced no error until somebody asked for the operator.
+      # @unary was keyed on `logistic:`, Nx has no `:logistic` op, so the Sigmoid mapping was
+      # dead code and Nx.sigmoid raised "no ONNX lowering" with its own entry one line away.
+      # Asserting the emitted node type rather than just {:ok, _}: a lowering that produced the
+      # wrong operator would satisfy the weaker check.
+      tpl = [Nx.template({1, 4, 4, 2}, :f32)]
+      assert {:ok, model} = NxShuttle.to_model(&Nx.sigmoid/1, tpl)
+
+      ops = for n <- model.graph.node, do: n.op_type
+      assert "Sigmoid" in ops, "sigmoid lowered to #{inspect(ops)} rather than Sigmoid"
+    end
+
+    test "a graph the spec evaluator rejects is reported, and its neighbours still run" do
+      # SpecRef.run/1 claims a rejection is a result rather than a crash, and that the other
+      # cases in the batch survive it. Both halves need a broken input to mean anything: bytes
+      # that are not a model at all, batched next to one that is.
+      if :specref in elem(Reference.engines(), 0) do
+        tpl = [Nx.template(Nx.shape(@x), Nx.type(@x))]
+        good = NxShuttle.encode(NxShuttle.to_model!(&Nx.add(&1, 1.0), tpl))
+
+        got =
+          Reference.run(:specref, [
+            %{name: "garbage", model: <<0, 1, 2, 3, 4, 5, 6, 7>>, input: @x},
+            %{name: "good", model: good, input: @x}
+          ])
+
+        assert {:error, why} = got["garbage"]
+        assert is_binary(why) and why != ""
+        assert {:ok, _} = got["good"]
+      end
+    end
+
+    test "the precision rungs are distinct, and an unnamed rung fails loudly" do
+      # A dial whose settings are all the same dial is not a dial. Measured, these differ:
+      # add is 0.019428 at :default and 0.000166 at :a16_w16.
+      assert DFC.precision_script(:default) == nil
+      assert DFC.precision_script(:w4) != DFC.precision_script(:a16_w16)
+      assert DFC.precision_script(:w4) =~ "4bit"
+      assert DFC.precision_script(:a16_w16) =~ "16bit"
+
+      assert_raise FunctionClauseError, fn -> DFC.precision_script(:a32_w32) end
     end
 
     test "a dot that is not a trailing/leading contraction is reported" do
