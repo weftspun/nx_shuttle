@@ -52,7 +52,11 @@ defmodule NxShuttle.Lowering do
     {name, push(state, node)}
   end
 
-  @unary %{sqrt: "Sqrt", erf: "Erf", exp: "Exp", logistic: "Sigmoid", negate: "Neg"}
+  # `sigmoid`, not `logistic`. The key here read `logistic:` and could never fire: Nx has no
+  # `:logistic` op -- `Nx.sigmoid/1` builds `:sigmoid` -- so `Sigmoid` was unreachable and
+  # `Nx.sigmoid` raised "no ONNX lowering" while a Sigmoid mapping sat right here. Found by
+  # sweeping every operator this module claims to emit rather than the seven the suite covered.
+  @unary %{sqrt: "Sqrt", erf: "Erf", exp: "Exp", sigmoid: "Sigmoid", negate: "Neg"}
 
   defp apply_op(op, [arg], t, params, state) when is_map_key(@unary, op) do
     {inp, state} = do_lower(arg, params, state)
