@@ -97,7 +97,10 @@ defmodule NxShuttle.LoweringTest do
       rows =
         for engine <- engines, {name, _} <- cs do
           expected = funs[name].(@x)
-          d = fn t -> Nx.subtract(t, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number() end
+
+          d = fn t ->
+            Nx.subtract(t, expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+          end
 
           verdict =
             case per_engine[engine][name] do
@@ -136,9 +139,14 @@ defmodule NxShuttle.LoweringTest do
               "float #{fmt(nat)} | quantized max #{fmt(exact)} bias #{fmt(mean)} " <>
                 "sd #{fmt(sd)} (bias is #{fmt(share)}% of max)"
 
-            {:agrees, d} -> "agrees (max|diff| #{fmt(d)})"
-            {:disagrees, d} -> "DISAGREES by #{fmt(d)}"
-            {:rejected, why} -> "rejected: #{String.slice(why, 0, 60)}"
+            {:agrees, d} ->
+              "agrees (max|diff| #{fmt(d)})"
+
+            {:disagrees, d} ->
+              "DISAGREES by #{fmt(d)}"
+
+            {:rejected, why} ->
+              "rejected: #{String.slice(why, 0, 60)}"
           end
 
         IO.puts("  #{String.pad_trailing("#{e}", 7)} #{String.pad_trailing(n, 10)} #{text}")
@@ -151,7 +159,14 @@ defmodule NxShuttle.LoweringTest do
       # property of the target and is reported, not asserted away.
       wrong =
         for {e, n, v} <- rows,
-            d = case(v, do: ({:disagrees, x} -> x; {:two, x, _, _, _} when x > 1.0e-5 -> x; _ -> nil)),
+            d =
+              case(v,
+                do: (
+                  {:disagrees, x} -> x
+                  {:two, x, _, _, _} when x > 1.0e-5 -> x
+                  _ -> nil
+                )
+              ),
             d != nil,
             do: "#{e}/#{n} by #{d}"
 
@@ -175,7 +190,10 @@ defmodule NxShuttle.LoweringTest do
       end
 
       accepted =
-        for {e, n, v} <- rows, match?({:agrees, _}, v) or match?({:two, _, _, _, _}, v), do: {e, n}
+        for {e, n, v} <- rows,
+            match?({:agrees, _}, v) or match?({:two, _, _, _, _}, v),
+            do: {e, n}
+
       assert accepted != [], "no target accepted anything, so nothing was measured"
 
       # THE CROSS-CHECK, and the reason both targets run rather than whichever was handy. An
@@ -208,7 +226,11 @@ defmodule NxShuttle.LoweringTest do
       # agreement test exists to catch. If this passes, that test is decoration.
       tpl = [Nx.template(Nx.shape(@x), Nx.type(@x))]
       swapped = fn t -> Nx.subtract(Nx.multiply(t, 0.0) |> Nx.add(0.25), t) end
-      built = [%{name: "swapped", model: NxShuttle.encode(NxShuttle.to_model!(swapped, tpl)), input: @x}]
+
+      built = [
+        %{name: "swapped", model: NxShuttle.encode(NxShuttle.to_model!(swapped, tpl)), input: @x}
+      ]
+
       expected = Nx.subtract(@x, 0.25)
 
       checked =
