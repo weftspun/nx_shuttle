@@ -83,9 +83,7 @@ defmodule NxShuttle.Lowering do
     divide: "Div",
     equal: "Equal",
     greater: "Greater",
-    greater_equal: "GreaterOrEqual",
     less: "Less",
-    less_equal: "LessOrEqual",
     pow: "Pow",
     max: "Max",
     min: "Min"
@@ -220,16 +218,40 @@ defmodule NxShuttle.Lowering do
     simple("Reciprocal", [root], t, state)
   end
 
-  # NOT_EQUAL IS TWO NODES, because the specification does not carry it. Read out of `onnx.defs`
-  # at opset 17 rather than assumed: Less, Greater, LessOrEqual, GreaterOrEqual, Equal and Not
-  # are all present and NotEqual is not, so the negation is left to the caller. Every other
-  # comparison is one node and sits in @binary above.
-  defp apply_op(:not_equal, [lhs, rhs], t, params, state) do
-    {l, state} = do_lower(lhs, params, state)
-    {r, state} = do_lower(rhs, params, state)
-    {eq, state} = simple("Equal", [l, r], t, state)
-    simple("Not", [eq], t, state)
-  end
+  # THE TARGET HAS STRICT COMPARISONS ONLY, so the non-strict ones are built by NEGATING a
+  # strict one arithmetically. Measured one graph per container run, against the true predicate:
+  #
+  #     LessOrEqual(x, c)          REJECTED InvalidHNError
+  #     Not(Greater(x, c))         REJECTED ParsingWithRecommendationException
+  #     GreaterOrEqual(c, x)       REJECTED InvalidHNError   (flipping operands does not help)
+  #     1 - Greater(x, c)          compiles, exact
+  #
+  # `Not` is refused standing alone, and flipping operands changes nothing because the refusal
+  # is per-operator rather than per-shape: Less, Greater and Equal are accepted, LessOrEqual,
+  # GreaterOrEqual and Not are not. Subtracting from one is the same negation without the
+  # operator the target will not take.
+  #
+  # EQUAL IS ACCEPTED, and an earlier version of this file said otherwise. The evidence for that
+  # was `equal(t, t)`, which Nx folds away -- the compiler returned
+  # `ValidationError: [] should be non-empty`, which is a complaint about an EMPTY GRAPH and not
+  # about the operator. `equal(t, const)` and `equal(t, t * 2)` both compile, diff 0.0. The
+  # degenerate case was mistaken for a capability limit and the mistake reached several commit
+  # messages before this measurement corrected it.
+  #
+  # THE EMITTED GRAPH IS LESS IDIOMATIC ONNX and that is the trade. A standard consumer would
+  # rather see LessOrEqual; this emits Greater and Sub. The specification carries both, the spec
+  # evaluator computes both exactly, and only one of them reaches the accelerator.
+  #
+  # Output type is float rather than {:u, 8}, as with logical_and above. The values agree and
+  # the labels do not, and a Cast to fix the label is what the Cast rule refuses.
+  defp apply_op(:less_equal, [lhs, rhs], t, params, state),
+    do: negated_compare("Greater", lhs, rhs, t, params, state)
+
+  defp apply_op(:greater_equal, [lhs, rhs], t, params, state),
+    do: negated_compare("Less", lhs, rhs, t, params, state)
+
+  defp apply_op(:not_equal, [lhs, rhs], t, params, state),
+    do: negated_compare("Equal", lhs, rhs, t, params, state)
 
   defp apply_op(:select, [pred, on_true, on_false], t, params, state) do
     {p, state} = do_lower(pred, params, state)
@@ -353,6 +375,50 @@ defmodule NxShuttle.Lowering do
   defp lossy_cast?({:u, _}, {:s, _}), do: true
   defp lossy_cast?({:f, a}, {:f, b}), do: b < a
   defp lossy_cast?(_, _), do: false
+
+  # `1 - cmp(a, b)`, where cmp is the strict comparison the target accepts.
+  #
+  # THE CAST IS REQUIRED, NOT DECORATION. ONNX comparisons output `tensor(bool)` and `Sub` does
+  # not accept bool operands, so the bool has to be widened before it can be subtracted from.
+  # A first version omitted it and the spec evaluator refused the graph with "Input type
+  # mismatch" -- while the accelerator compiled it and returned the right numbers. The lenient
+  # engine agreed and the strict one was correct, which is the reverse of the usual direction
+  # and the reason both are run.
+  #
+  # THE WIDENING IS TO FLOAT, NOT TO {:u, 8}. Both are valid ONNX and the spec evaluator computes
+  # either exactly; the accelerator refuses the integer one with
+  # ParsingWithRecommendationException and takes the float one. logical_and above is the same
+  # shape and the same reason -- this target wants float arithmetic even where the values are
+  # zero and one.
+  #
+  # Output is float where Nx types the result {:u, 8}. The values agree and the labels do not,
+  # and a Cast back would be the value-changing Cast this target accepts without performing.
+  defp negated_compare(cmp, lhs, rhs, t, params, state) do
+    {l, state} = do_lower(lhs, params, state)
+    {r, state} = do_lower(rhs, params, state)
+    ft = Nx.template(Nx.shape(t), Nx.type(lhs))
+    {c, state} = simple(cmp, [l, r], ft, state)
+    {widened, state} = cast_to(c, Nx.type(lhs), state)
+    {one, state} = scalar_const(1.0, ft, state)
+    simple("Sub", [one, widened], t, state)
+  end
+
+  # A Cast node emitted directly. Not routed through the :as_type clause because that one guards
+  # against value-changing casts by inspecting Nx types, and bool is not an Nx type -- it is an
+  # ONNX one that only ever appears between a comparison and its consumer.
+  defp cast_to(input, to, state) do
+    {name, state} = fresh("Cast", state)
+
+    node = %Node{
+      input: [input],
+      output: [name],
+      name: name,
+      op_type: "Cast",
+      attribute: [%Attribute{name: "to", type: :INT, i: onnx_type(to)}]
+    }
+
+    {name, push(state, node)}
+  end
 
   # One arithmetic predicate: 1 where the input is nonzero, 0 where it is not. Used by
   # logical_and; kept separate because any other boolean lowering will want the same shape.
