@@ -417,6 +417,56 @@ defmodule NxShuttle.LoweringTest do
       assert message =~ "refusing to emit Round"
     end
 
+    test "every ai.onnx operator in 15-21 routes, and provenance is not lost" do
+      # The module states counts in its own comments, and a count in a comment drifts. This
+      # holds them: every operator gets a decision, and MEASURED stays distinguishable from
+      # PREDICTED FROM THE TABLE. The tables have been wrong once already -- Table 4 gives
+      # Gelu's ONNX form as `Mul, Erf`, and emitting exactly that is refused -- so a prediction
+      # quietly becoming a result is the failure this guards.
+      ops = NxShuttle.HailoRoute.opset()
+      assert length(ops) == 193
+      assert length(NxShuttle.HailoRoute.documented()) == 62
+      assert map_size(NxShuttle.HailoRoute.measured()) == 35
+
+      for op <- ops do
+        assert NxShuttle.HailoRoute.route(op) != nil
+      end
+
+      assert {:accept, :measured} = NxShuttle.HailoRoute.route("Add")
+      assert {:accept, :predicted_from_table} = NxShuttle.HailoRoute.route("Conv")
+    end
+
+    test "the calibration domain is checked, not the input domain" do
+      # A strictly positive tensor can still hand negatives to a partial function, because the
+      # optimizer calibrates on [lo - pad, hi + pad] with pad = 0.05 * max(|lo|, |hi|, 1).
+      # Measured: [0.5, 5.375] pads to 0.23 and sqrt is exact; [0.125, 16.0] pads to -0.675 and
+      # sqrt, log and rsqrt are all refused. Both inputs are positive.
+      #
+      # An earlier version of this branch tested `lo` and would have passed both.
+      assert {:accept, :measured} =
+               NxShuttle.HailoRoute.route("Sqrt", input_domain: {0.5, 5.375})
+
+      assert {:refuse_at_emission, {:calibration_reaches_negative, "Sqrt", _, floor}} =
+               NxShuttle.HailoRoute.route("Sqrt", input_domain: {0.125, 16.0})
+
+      assert_in_delta floor, -0.675, 1.0e-9
+    end
+
+    test "domain and opset are asked before the operator is looked at" do
+      assert {:refuse, {:foreign_domain, _}} =
+               NxShuttle.HailoRoute.route("Add", domain: "ai.onnx.contrib")
+
+      assert {:refuse, {:opset_out_of_range, 22, _}} =
+               NxShuttle.HailoRoute.route("Add", opset: 22)
+
+      # And a graph that folds to nothing is refused whatever it contained -- measured as
+      # UnsupportedModelError for identity, add(x, 0.0) and mul(x, 1.0), and as
+      # "ValidationError: [] should be non-empty" for equal(t, t). Mistaking that for an
+      # operator refusal is how "Equal is unsupported" reached several commit messages.
+      assert {:refuse, :graph_folds_to_nothing} =
+               NxShuttle.HailoRoute.route("Add", folds_to_nothing: true)
+    end
+
     test "a dot that is not a trailing/leading contraction is reported" do
       tpl = [Nx.template({2, 4}, :f32), Nx.template({2, 4}, :f32)]
       assert {:error, message} = NxShuttle.to_model(fn x, y -> Nx.dot(x, [0], y, [0]) end, tpl)
