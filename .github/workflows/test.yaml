@@ -1,34 +1,47 @@
-name: AxonOnnx CI
+# WHAT THIS RUNS, AND WHAT IT CANNOT. The suite compares an emitted ONNX graph against two
+# engines: the Hailo Dataflow Compiler, and the ONNX specification's own reference evaluator.
+# A hosted runner has neither a licensed Hailo wheel nor the multi-gigabyte image, so `engines()`
+# yields `[:specref]` alone and `Reference.caveat/1` says so out loud -- SPEC ONLY, meaning the
+# emitted graph is correct per the specification and nothing has been said about whether the
+# accelerator accepts it. That is a real result, not a skipped one, and the two operators the
+# compiler refuses pass here, so a Hailo limitation is invisible in this configuration.
+#
+# The authoritative run happens on a desk with the image. This gate exists so that the rest --
+# lowering correctness, formatting, and every negative control -- stops depending on one machine.
+name: nx_shuttle
+
 on:
   pull_request:
   push:
     branches:
-      - master
+      - main
+
 jobs:
   main:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+
       - name: Install Erlang & Elixir
         uses: erlef/setup-beam@v1
         with:
-          otp-version: '25.0'
-          elixir-version: '1.14.5'
-      - name: Install Python
-        uses: actions/setup-python@v2
-        with:
-          python-version: '3.9'
-      - name: Install ONNX
-        run: pip install numpy onnx onnxruntime
-      - name: Install transformers
-        run: pip install git+https://github.com/huggingface/transformers.git sentencepiece pillow torch tensorflow
+          otp-version: '27.2'
+          elixir-version: '1.18.2'
+
+      # No Python step, and no ONNX or transformers install. `pythonx` embeds CPython and
+      # resolves its own dependencies from the pins in `NxShuttle.SpecRef`'s @pyproject, so a
+      # system interpreter is neither used nor consulted. The previous workflow installed
+      # transformers, torch, tensorflow, sentencepiece and pillow -- none of which anything under
+      # test/ imports -- and the first run this repository ever completed failed on exactly that
+      # step: transformers requires Python >= 3.10 against a pinned 3.9.
+      #
+      # protoc is gone for the same reason. It is needed by `mix generate_protobuf`, which
+      # regenerates lib/onnx and is not part of the suite.
       - name: Install mix dependencies
         run: mix deps.get
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-        with:
-          version: '3.x'
+
       - name: Check formatting
         run: mix format --check-formatted
+
       - name: Run tests
         run: MIX_ENV=test mix do compile --warnings-as-errors, test

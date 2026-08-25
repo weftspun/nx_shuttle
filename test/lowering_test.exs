@@ -345,9 +345,12 @@ defmodule NxShuttle.LoweringTest do
       for {fun, wanted} <- [
             {&Nx.less(&1, 2.9), ["Less"]},
             {&Nx.greater(&1, 2.9), ["Greater"]},
-            {&Nx.less_equal(&1, 2.9), ["LessOrEqual"]},
-            {&Nx.greater_equal(&1, 2.9), ["GreaterOrEqual"]},
-            {&Nx.not_equal(&1, 2.9), ["Equal", "Not"]}
+            # NOT LessOrEqual / GreaterOrEqual / Not. This target has strict comparisons only,
+            # so the non-strict ones are `1 - strict`, widened through a Cast because ONNX
+            # comparisons output bool and Sub does not take bool operands.
+            {&Nx.less_equal(&1, 2.9), ["Greater", "Cast", "Sub"]},
+            {&Nx.greater_equal(&1, 2.9), ["Less", "Cast", "Sub"]},
+            {&Nx.not_equal(&1, 2.9), ["Equal", "Cast", "Sub"]}
           ] do
         assert {:ok, model} = NxShuttle.to_model(fun, tpl)
         ops = for n <- model.graph.node, do: n.op_type
