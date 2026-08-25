@@ -43,5 +43,12 @@ jobs:
       - name: Check formatting
         run: mix format --check-formatted
 
+      # Dependencies compile FIRST and without the flag. `--warnings-as-errors` is meant to
+      # police this repository's code, and protox emits warnings about optional Poison structs
+      # it never requires. Compiling everything in one invocation applies the flag to those too,
+      # which fails the build on a third party's choices.
+      - name: Compile dependencies
+        run: MIX_ENV=test mix deps.compile
+
       - name: Run tests
         run: MIX_ENV=test mix do compile --warnings-as-errors, test
